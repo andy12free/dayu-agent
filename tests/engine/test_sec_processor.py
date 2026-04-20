@@ -2247,7 +2247,7 @@ def test_context_and_header_helper_paths() -> None:
     assert sec_table_extraction._extract_context_before("s_0001", by_ref, "   ") == ""
     assert sec_table_extraction._resolve_dom_context_by_index([" a "], 2) == ""
 
-    df = pd.DataFrame(columns=["Products", "Products"])
+    df = pd.DataFrame(columns=pd.Index(["Products", "Products"], dtype="object"))
     assert sec_table_extraction._extract_headers_from_dataframe(df) is None
     assert sec_table_extraction._extract_row_headers_from_table_dict(_BadTableDict()) is None
 
@@ -2297,8 +2297,8 @@ def test_render_helpers_and_text_snippets(monkeypatch: pytest.MonkeyPatch) -> No
     assert no_records is None
 
     monkeypatch.setattr(sec_table_extraction, "_safe_table_dataframe", lambda table_obj: _BadMarkdownDf())
-    markdown = sec_processor._render_markdown_table(type("T", (), {"to_dict": lambda self: {"a": 1}})(), "")
-    assert "a" in markdown
+    with pytest.raises(RuntimeError, match="SEC 表格 markdown 渲染失败"):
+        sec_processor._render_markdown_table(type("T", (), {"to_dict": lambda self: {"a": 1}})(), "")
 
     assert sec_table_extraction._normalize_optional_string("  a \n b  ") == "a b"
 

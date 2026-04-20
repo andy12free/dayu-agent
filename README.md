@@ -1,7 +1,8 @@
 # 大愚 Agent — 用户手册
 
-`大愚 Agent` 是一个面向买方财报分析场景的 Agent 系统。它把 LLM、结构化财报工具、财报下载与预处理管线、报告写作流程组合成一套统一系统。  
-`大愚 Agent` 还具备完整的“宿主强约束下的 LLM in the loop的能力”，基础架构能力上已经对齐OpenClaw，后续会加上现在OpenClaw能做的事情。
+`大愚 Agent` 是每个投资者的助理分析师。  
+- `大愚 Agent` 是一个面向买方财报分析场景的 Agent 系统，但它不是简单的功能组合，`大愚 Agent` 让AI读财报的方式从丢给它整份财报“大海捞针”变成“按图索骥”，让数据有置信度，让投资结论、投资报告可审计、可追踪。  
+- `大愚 Agent` 还具备完整的“宿主强约束下的 LLM in the loop 的能力”，基础架构能力上已经对齐 OpenClaw ，后续会加上现在 OpenClaw 能做的事情。
 
 当前你可以用它完成四类工作：
 - 财报数据管线：美股财报下载、美股 / A 股 / 港股财报上传。
@@ -42,29 +43,77 @@
 
 ### 1.1 安装
 
-需要 Python 3.11+。
+安装使用 `大愚 Agent` 前需安装Python 3.11。
+
+#### 1.1.1 在线安装
+
+如果你当前机器可以联网，并且接受由 `pip` 在线解析并下载第三方依赖，可以直接安装 Release 中的 wheel：
+
+命令格式：
 
 ```bash
-pip install https://github.com/noho/dayu-agent/releases/download/v0.1.1/dayu_agent-0.1.1-py3-none-any.whl
+pip install https://github.com/noho/dayu-agent/releases/download/<version>/dayu_agent-<version>-py3-none-any.whl
 ```
 
-安装后即可在终端使用 `dayu-cli` 和 `dayu-wechat` 命令。
-
-以后升级到新版本时，替换为新版 wheel 地址即可：
+示例（替换为最新版本号）：
 
 ```bash
-pip install --upgrade https://github.com/noho/dayu-agent/releases/download/v0.2.0/dayu_agent-0.2.0-py3-none-any.whl
+pip install https://github.com/noho/dayu-agent/releases/download/v0.1.2/dayu_agent-0.1.2-py3-none-any.whl
 ```
 
-如需 PDF 渲染，还需要：
+这种方式最轻，但安装耗时和成功率会受网络、平台和上游依赖发布状态影响。
+
+#### 1.1.2 下载离线安装包
+
+前往 GitHub Releases，下载与你平台匹配的离线安装包：
+
+- `dayu-agent-<version>-macos-arm64-offline.tar.gz`
+- `dayu-agent-<version>-linux-x64-offline.tar.gz`
+- `dayu-agent-<version>-windows-x64-offline.zip`
+
+说明：
+- 当前 GitHub Release 默认提供 3 个离线安装包：`macos-arm64`、`linux-x64`、`windows-x64`。
+- `macos-x64` 离线安装包这次不随 Release 发布，请使用在线安装。
+
+macOS / Linux 示例：
 
 ```bash
-brew install pandoc
+tar -xzf dayu-agent-0.1.2-macos-arm64-offline.tar.gz
+cd dayu-agent-0.1.2-macos-arm64-offline
+./install.sh
 ```
 
-并安装 Google Chrome。
+Windows PowerShell 示例：
 
-### 1.2 初始化工作区与配置
+```powershell
+Expand-Archive .\dayu-agent-0.1.2-windows-x64-offline.zip -DestinationPath .
+cd .\dayu-agent-0.1.2-windows-x64-offline
+.\install.cmd
+```
+
+安装完成后，还需要执行一次：
+
+```bash
+playwright install chromium
+```
+
+如需渲染 PDF，可选安装 `pandoc`：
+
+- macOS：`brew install pandoc`
+- Ubuntu / Debian：`sudo apt-get install pandoc`
+- Windows：`choco install pandoc` 或从 [pandoc 官网](https://pandoc.org/installing.html) 下载安装
+
+### 1.2 验证安装
+
+安装完成后，先确认命令入口可用：
+
+```bash
+dayu-cli --help
+dayu-wechat --help
+dayu-render --help
+```
+
+### 1.3 初始化工作区与配置
 
 安装后运行一次 `init`，交互式完成配置复制、模型供应商选择和 API Key 设置：
 
@@ -74,11 +123,13 @@ dayu-cli init
 
 `init` 会依次执行：
 
-1. 复制包内默认配置到 `./workspace/config/`
-2. 让你选择模型供应商（Mimo / DeepSeek / OpenAI / Anthropic / Gemini / 通义千问）
+1. 复制包内默认配置到 `./workspace/config/` ，复制包内默认写作模板到 `./workspace/assets/` 。
+2. 让你选择初始化模型方案（Mimo Token Plan / Mimo Token Plan SG / Mimo Pro / Mimo Flash / DeepSeek / OpenAI / Anthropic / Gemini / 通义千问）
 3. 输入对应 API Key 并永久写入环境变量（macOS/Linux 写 shell profile，Windows 用 setx）
 4. 自动更新 manifest 中的默认模型为你选择的供应商模型
 5. 可选配置联网检索 API Key（TAVILY / SERPER / FMP）
+6. 自动检测 HuggingFace 官方 Hub 连通性：不可达时默认启用镜像加速（`HF_ENDPOINT`），可达时默认跳过；均可手动选择。可选配置 `HF_TOKEN` 提升下载稳定性。
+7. 首次初始化完成后，自动预热一次 CLI 运行时；若预热失败，不影响工作区初始化成功，但后续首次运行 `prompt` / `interactive` / `write` 时可能更慢。
 
 可选参数：
 
@@ -88,14 +139,16 @@ dayu-cli init --overwrite              # 覆盖已有配置
 ```
 
 API Key 申请地址：
-- MIMO_PLAN_API_KEY / MIMO_API_KEY：https://platform.xiaomimimo.com/#/console/api-keys
+- MIMO_PLAN_API_KEY / MIMO_PLAN_SG_API_KEY / MIMO_API_KEY：https://platform.xiaomimimo.com/#/console/api-keys
 - DEEPSEEK_API_KEY：https://platform.deepseek.com/api_keys
 - FMP_API_KEY：https://site.financialmodelingprep.com/developer/docs/dashboard
 - TAVILY_API_KEY：https://app.tavily.com/home
 - SERPER_API_KEY：https://serper.dev/
 
 说明：
-- 默认推荐 Mimo Token Plan（mimo-v2-pro-plan），性价比最优。
+- 默认推荐 Mimo Token Plan（mimo-v2-pro-plan），性价比最优。（注： MIMO_PLAN_API_KEY / MIMO_API_KEY 是两个不同的KEY，不能混用）。
+- 海外用户选Mimo Token Plan SG。
+- `MIMO_API_KEY` 可在 `init` 中分别选择 `Mimo Pro` 或 `Mimo Flash` 作为默认模型方案。
 - 联网搜索默认可走 `auto`，若配置了 Tavily / Serper，会优先使用对应 provider。
 - 若运行环境需要访问 `localhost`、私网 IP 或内网域名，可在 `workspace/config/run.json` 的 `web_tools_config.allow_private_network_url` 中显式打开内网访问开关。
 - `workspace/config/llm_models.json` 当前只允许 `openai_compatible` 模型配置；CLI runner 已禁用。
@@ -106,33 +159,35 @@ API Key 申请地址：
 ```text
 workspace/
 ├── config/           # 运行时配置（覆盖包内默认配置）
+├── assets/           # 定性分析模板（覆盖包内默认模板）
 ├── .dayu/            # 系统隐藏工作目录（batch 暂存、备份恢复等）
 ├── portfolio/        # 每个 ticker 的财报与材料
 ├── draft/            # write 输出目录
 └── output/           # tool trace 等辅助输出
 ```
 
-说明：`workspace/.dayu/` 由系统自动维护，当前会承载财报仓储的 batch 暂存与 crash recovery 备份；不需要手动创建或清理。
+说明：`workspace/.dayu/` 由系统自动维护，当前会承载财报仓储的 batch 暂存与 crash recovery 备份；不需要手动创建或清理。如果运行有异常全部删除也没有影响。  
 
 ### 1.4 跑通第一条命令
 
-推荐先跑一条单次 prompt：
+推荐先下载一份财报：
 
 ```bash
-dayu-cli prompt "总结苹果最新财报的主要风险"
+dayu-cli download --ticker AAPL
 ```
 
-如果你已经通过 `download`、`upload_filing` 或 `upload_filings_from` 导入过 AAPL 的财报，命令会自动检测本地财报并挂载财报工具后返回结果。
-如果你希望明确指定研究对象，也可以这样写：
+下载完成后，再跑一条单次 prompt：
 
 ```bash
 dayu-cli prompt "总结最新财报的主要风险" --ticker AAPL
 ```
 
-如果还没有财报数据，可执行下载：
+如果你已经通过 `download`、`upload_filing` 或 `upload_filings_from` 导入过 AAPL 的财报，也可以直接提问；命令会自动检测本地财报并挂载财报工具后返回结果。
+
+如果你希望先不指定 `ticker`，也可以这样写：
 
 ```bash
-dayu-cli download --ticker AAPL
+dayu-cli prompt "总结苹果最新财报的主要风险"
 ```
 
 > 也可在微信对话或`interactive`里发送"下载苹果财报"进行下载。
@@ -232,8 +287,17 @@ dayu-wechat <command> [参数]
 | `--model-name` | `run` `service install` | 指定模型配置名称 |
 | `--temperature` | `run` `service install` | 覆盖模型 temperature |
 | `--web-provider` | `run` `service install` | 指定联网检索 provider |
+| `--debug-sse` | `run` `service install` | 开启 SSE 高频调试日志 |
+| `--debug-tool-delta` | `run` `service install` | 开启工具调用参数增量日志 |
+| `--debug-sse-sample-rate` | `run` `service install` | 设置 SSE 调试日志采样率 |
+| `--debug-sse-throttle-sec` | `run` `service install` | 设置 SSE 调试日志节流窗口 |
 | `--tool-timeout-seconds` | `run` `service install` | 覆盖工具超时 |
 | `--max-iterations` | `run` `service install` | 覆盖 Agent 最大迭代次数 |
+| `--fallback-mode` | `run` `service install` | 覆盖超限处理模式 |
+| `--fallback-prompt` | `run` `service install` | 覆盖超限补充提示 |
+| `--max-consecutive-failed-tool-batches` | `run` `service install` | 覆盖连续失败工具批次上限 |
+| `--max-duplicate-tool-calls` | `run` `service install` | 覆盖重复工具调用连续上限 |
+| `--duplicate-tool-hint-prompt` | `run` `service install` | 覆盖重复工具调用提示词 |
 | `--enable-tool-trace` | `run` `service install` | 开启工具调用追踪 |
 | `--tool-trace-dir` | `run` `service install` | 指定 trace 输出目录 |
 | `--doc-limits-json` | `run` `service install` | 覆盖文档工具 limits |
@@ -440,8 +504,8 @@ dayu-cli interactive --verbose
 | 命令 | 关键参数 | 说明 |
 |------|------|------|
 | `login` | `--label` `--relogin` `--qrcode-timeout-sec` | 建立或刷新登录态 |
-| `run` | `--model-name` `--temperature` `--enable-tool-trace` | 在当前终端以前台方式运行 |
-| `service install` | `--label` `--model-name` | 安装后台服务 |
+| `run` | `--model-name` `--temperature` `--web-provider` `--debug-sse` `--fallback-mode` `--enable-tool-trace` | 在当前终端以前台方式运行 |
+| `service install` | `--label` `--model-name` `--temperature` `--web-provider` `--debug-sse` `--fallback-mode` `--enable-tool-trace` | 安装后台服务 |
 | `service start` | `--label` | 启动后台服务 |
 | `service restart` | `--label` | 重启后台服务 |
 | `service stop` | `--label` | 停止后台服务 |
@@ -526,7 +590,7 @@ dayu-wechat service uninstall
 | `--infer` | 可选，只执行公司级 facet 归因并写回 manifest |
 | `--summary` | 可选，只打印上次写作结果摘要，不进入写作 |
 | `--resume` / `--no-resume` | 可选，控制是否断点恢复 |
-| `--template` | 可选，写作模板路径，默认 `./定性分析模板.md` |
+| `--template` | 可选，写作模板路径，默认 `workspace/assets/定性分析模板.md`，回退 `dayu/assets/定性分析模板.md` |
 | `--output` | 可选，输出目录，默认 `workspace/draft/{ticker}` |
 | `--model-name` | 可选，主写作模型配置 |
 | `--audit-model-name` | 可选，审计模型配置 |
@@ -546,7 +610,7 @@ dayu-cli write --ticker AAPL --chapter "经营表现与核心驱动" --fast
 dayu-cli write --ticker AAPL --infer
 dayu-cli write --ticker AAPL --summary
 dayu-cli write --ticker AAPL \
-  --template ./定性分析模板.md \
+  --template ./workspace/assets/定性分析模板.md \
   --output ./workspace/draft/AAPL \
   --enable-tool-trace
 ```

@@ -18,6 +18,7 @@ from dayu.fins.downloaders.sec_downloader import (
     RemoteFileDescriptor,
     Sc13PartyRoles,
     SecDownloader,
+    _await_if_needed,
     _parse_browse_edgar_atom,
     _parse_browse_edgar_href,
     _parse_index_header_document_entries,
@@ -25,7 +26,6 @@ from dayu.fins.downloaders.sec_downloader import (
     _parse_retry_after,
     _load_sec_throttle_state,
     _resolve_sec_throttle_delay,
-    _safe_int,
     _select_primary_from_index_items,
     extract_same_filing_linked_html_files,
     _format_accession_with_dash,
@@ -37,6 +37,7 @@ from dayu.fins.downloaders.sec_downloader import (
     pick_taxonomy_files,
 )
 from dayu.fins.domain.document_models import FileObjectMeta
+from dayu.fins._converters import optional_int
 
 
 class StoreStub:
@@ -121,12 +122,25 @@ def test_basic_helpers_cover_edge_cases(tmp_path: Path) -> None:
     ]
     assert pick_form_document_files(items_by_type, "6-K") == ["form6-k.htm"]
 
-    assert _safe_int(None) is None
-    assert _safe_int("") is None
-    assert _safe_int("abc") is None
-    assert _safe_int("12") == 12
+    assert optional_int(None) is None
+    assert optional_int("") is None
+    assert optional_int("abc") is None
+    assert optional_int("12") == 12
     assert _format_accession_with_dash("000116737925000017") == "0001167379-25-000017"
     assert _format_accession_with_dash("bad-accession") == "bad-accession"
+
+
+def test_await_if_needed_ignores_non_awaitable_dunder_await_marker() -> None:
+    """验证 `_await_if_needed` 不会把伪 `__await__` 属性误判为可等待对象。"""
+
+    class FakeAwaitMarker:
+        """暴露伪 `__await__` 属性但并非 awaitable 的对象。"""
+
+        __await__ = None
+
+    marker = FakeAwaitMarker()
+
+    assert _run(_await_if_needed(marker)) is marker
 
 
 def test_extract_same_filing_linked_html_files_filters_to_same_archive_html() -> None:
@@ -1350,8 +1364,8 @@ def test_try_fetch_index_items_and_helper_paths(tmp_path: Path, monkeypatch: pyt
 
     assert downloader._build_headers()["User-Agent"] == "UA"
     assert downloader._build_headers()["Accept-Encoding"] == "gzip, deflate"
-    assert _safe_int("12") == 12
-    assert _safe_int("abc") is None
+    assert optional_int("12") == 12
+    assert optional_int("abc") is None
     from dayu.fins.downloaders.sec_downloader import _safe_header
 
     assert _safe_header(None, "ETag") is None
@@ -1391,8 +1405,8 @@ def test_parse_index_header_document_entries_from_escaped_payload() -> None:
     ]
 
 
-def test_read_response_bytes_and_parse_atom_error() -> None:
-    """验证响应读取异常与 browse-edgar XML 解析异常。
+def test_parse_browse_edgar_atom_error() -> None:
+    """验证 browse-edgar XML 解析异常。
 
     Args:
         无。
@@ -1404,27 +1418,6 @@ def test_read_response_bytes_and_parse_atom_error() -> None:
         AssertionError: 断言失败时抛出。
     """
 
-    class _GoodResponse:
-        """测试正常响应对象。"""
-
-        def iter_content(self, chunk_size: int) -> Any:
-            del chunk_size
-            yield b"a"
-            yield b""
-            yield b"b"
-
-    class _BadResponse:
-        """测试异常响应对象。"""
-
-        def iter_content(self, chunk_size: int) -> Any:
-            del chunk_size
-            raise RuntimeError("bad stream")
-
-    from dayu.fins.downloaders.sec_downloader import _read_response_bytes
-
-    assert _read_response_bytes(_GoodResponse()) == b"ab"
-    with pytest.raises(RuntimeError, match="读取响应体失败"):
-        _read_response_bytes(_BadResponse())
     with pytest.raises(RuntimeError, match="browse-edgar XML 解析失败"):
         _parse_browse_edgar_atom(b"<feed>")
 
@@ -1543,6 +1536,48 @@ def test_throttle_retry_on_503(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert any(s >= 600.0 for s in sleep_calls)
     state = _load_sec_throttle_state(downloader._throttle_state_path)
     assert state.cooldown_until > 0
+
+
+def test_conditional_download_reuses_shared_throttle_retry_strategy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证条件下载同样复用 SEC 限流额外重试策略。"""
+
+    call_count = 0
+    request = httpx.Request("GET", "https://example.com/archive.htm")
+
+    async def _mock_get(**kwargs: Any) -> httpx.Response:
+        nonlocal call_count
+        del kwargs
+        call_count += 1
+        if call_count <= 2:
+            return httpx.Response(503, headers={"Retry-After": "0.01"}, request=request)
+        return httpx.Response(200, content=b"payload", request=request)
+
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    downloader = SecDownloader(workspace_root=tmp_path)
+    downloader.configure(user_agent="UA", sleep_seconds=0.0, max_retries=1)
+    downloader._client.get = _mock_get  # type: ignore[assignment]
+
+    status_code, payload = _run(
+        downloader._http_download_if_modified(
+            "https://example.com/archive.htm",
+            '"etag"',
+            "Mon, 01 Jan 2025 00:00:00 GMT",
+        )
+    )
+
+    assert status_code == 200
+    assert payload == b"payload"
+    assert call_count == 3
+    assert any(seconds >= 600.0 for seconds in sleep_calls)
 
 
 def test_rate_limit_uses_shared_state_across_instances(

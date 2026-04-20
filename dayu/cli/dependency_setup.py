@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
@@ -22,13 +21,13 @@ from dayu.cli.interactive_state import (
 )
 from dayu.contracts.infrastructure import ConfigLoaderProtocol, PromptAssetStoreProtocol
 from dayu.contracts.session import SessionSource
-from dayu.contracts.toolset_config import ToolsetConfigSnapshot, build_toolset_config_snapshot
+from dayu.execution.cli_execution_options import build_execution_options_from_args
 from dayu.execution.options import (
     ExecutionOptions,
-    ExecutionOptionsOverridePayload,
     ResolvedExecutionOptions,
     TraceSettings,
-    normalize_temperature,
+    build_base_execution_options,
+    merge_execution_options,
     resolve_doc_tool_limits_from_toolset_configs,
     resolve_fins_tool_limits_from_toolset_configs,
     resolve_web_tools_config_from_toolset_configs,
@@ -37,27 +36,19 @@ from dayu.execution.runtime_config import AgentRuntimeConfig, RunnerRuntimeConfi
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.storage import FsSourceDocumentRepository
-from dayu.host import resolve_host_config
-from dayu.host.host import Host
+from dayu.host import Host
 from dayu.log import Log, LogLevel
-from dayu.services import prepare_scene_execution_acceptance_preparer, recover_host_startup_state, WriteRunConfig
-from dayu.services.host_admin_service import HostAdminService
+from dayu.services import prepare_host_runtime_dependencies, WriteRunConfig
 from dayu.services.chat_service import ChatService
 from dayu.services.fins_service import FinsService
 from dayu.services.prompt_service import PromptService
 from dayu.services.scene_execution_acceptance import SceneExecutionAcceptancePreparer
 from dayu.services.write_service import WriteService
 from dayu.services.contracts import WriteRequest
-from dayu.startup.dependencies import (
-    prepare_config_file_resolver,
-    prepare_config_loader,
-    prepare_default_execution_options,
-    prepare_fins_runtime,
-    prepare_model_catalog,
-    prepare_prompt_asset_store,
-    prepare_startup_paths,
-    prepare_workspace_resources,
-)
+from dayu.startup.config_file_resolver import ConfigFileResolver
+from dayu.startup.config_loader import ConfigLoader
+from dayu.startup.config_file_resolver import resolve_package_assets_path
+from dayu.startup.paths import resolve_startup_paths
 from dayu.startup.workspace import WorkspaceResources
 from dayu.workspace_paths import build_host_store_default_path, build_interactive_state_dir
 
@@ -76,35 +67,6 @@ _COMMANDS_ALLOW_MISSING_FILINGS_DIR = frozenset(
         "upload_material",
     }
 )
-
-
-def _build_toolset_override_snapshots(
-    *,
-    doc_limits: ExecutionOptionsOverridePayload | None,
-    fins_limits: ExecutionOptionsOverridePayload | None,
-) -> tuple[ToolsetConfigSnapshot, ...]:
-    """把 CLI 解析出的 limits override 收敛为通用 toolset override 快照。
-
-    Args:
-        doc_limits: 文档工具限制 override。
-        fins_limits: 财报工具限制 override。
-
-    Returns:
-        通用 toolset override 快照序列。
-
-    Raises:
-        TypeError: 当 override 无法构造成通用快照时抛出。
-        ValueError: 当 toolset 名称非法时抛出。
-    """
-
-    snapshots: list[ToolsetConfigSnapshot] = []
-    for snapshot in (
-        build_toolset_config_snapshot("doc", doc_limits),
-        build_toolset_config_snapshot("fins", fins_limits),
-    ):
-        if snapshot is not None:
-            snapshots.append(snapshot)
-    return tuple(snapshots)
 
 
 _COMMANDS_WARN_ON_MISSING_FILINGS_DIR = frozenset(
@@ -252,39 +214,7 @@ def _build_execution_options(args: argparse.Namespace) -> ExecutionOptions:
         SystemExit: limits JSON 非法时退出。
     """
 
-    doc_limits = _parse_limits_override(
-        getattr(args, "doc_limits_json", None),
-        field_name="--doc-limits-json",
-    )
-    fins_limits = _parse_limits_override(
-        getattr(args, "fins_limits_json", None),
-        field_name="--fins-limits-json",
-    )
-
-    return ExecutionOptions(
-        model_name=(raw_model_name if (raw_model_name := str(getattr(args, "model_name", "") or "").strip()) else None),
-        temperature=_parse_temperature_argument(getattr(args, "temperature", None), field_name="--temperature"),
-        debug_sse=bool(getattr(args, "debug_sse", False)),
-        debug_tool_delta=bool(getattr(args, "debug_tool_delta", False)),
-        debug_sse_sample_rate=getattr(args, "debug_sse_sample_rate", None),
-        debug_sse_throttle_sec=getattr(args, "debug_sse_throttle_sec", None),
-        tool_timeout_seconds=getattr(args, "tool_timeout_seconds", None),
-        max_iterations=getattr(args, "max_iterations", None),
-        fallback_mode=getattr(args, "fallback_mode", None),
-        fallback_prompt=getattr(args, "fallback_prompt", None),
-        max_consecutive_failed_tool_batches=getattr(args, "max_consecutive_failed_tool_batches", None),
-        max_duplicate_tool_calls=getattr(args, "max_duplicate_tool_calls", None),
-        duplicate_tool_hint_prompt=getattr(args, "duplicate_tool_hint_prompt", None),
-        web_provider=getattr(args, "web_provider", None),
-        trace_enabled=(True if bool(getattr(args, "enable_tool_trace", False)) else None),
-        trace_output_dir=Path(getattr(args, "tool_trace_dir")).expanduser().resolve()
-        if getattr(args, "tool_trace_dir", None)
-        else None,
-        toolset_config_overrides=_build_toolset_override_snapshots(
-            doc_limits=doc_limits,
-            fins_limits=fins_limits,
-        ),
-    )
+    return build_execution_options_from_args(args)
 
 
 def _build_interactive_state_store(workspace_dir: Path) -> FileInteractiveStateStore:
@@ -429,66 +359,9 @@ def setup_paths(args: argparse.Namespace) -> WorkspaceConfig:
     )
 
 
-def _parse_limits_override(
-    raw_json: str | None,
-    *,
-    field_name: str,
-) -> ExecutionOptionsOverridePayload | None:
-    """解析 limits 覆盖 JSON 字符串。
-
-    Args:
-        raw_json: 原始 JSON 字符串。
-        field_name: 字段名，仅用于错误提示。
-
-    Returns:
-        解析后的字典；输入为空时返回 ``None``。
-
-    Raises:
-        SystemExit: JSON 非法或不是对象时退出。
-    """
-
-    if raw_json is None:
-        return None
-    try:
-        parsed = json.loads(raw_json)
-    except json.JSONDecodeError as exc:
-        Log.error(f"{field_name} 不是合法 JSON: {exc}", module=MODULE)
-        raise SystemExit(2) from exc
-    if not isinstance(parsed, dict):
-        Log.error(f"{field_name} 必须是 JSON 对象", module=MODULE)
-        raise SystemExit(2)
-    normalized: ExecutionOptionsOverridePayload = {}
-    for key, value in parsed.items():
-        if value is None or isinstance(value, str | int | float | bool):
-            normalized[str(key)] = value
-            continue
-        Log.error(f"{field_name} 只允许 JSON 标量值，字段 {key!r} 非法", module=MODULE)
-        raise SystemExit(2)
-    return normalized
 
 
-def _parse_temperature_argument(raw_value: str | int | float | None, *, field_name: str) -> float | None:
-    """解析 CLI temperature 参数。
-
-    Args:
-        raw_value: 原始参数值。
-        field_name: 参数名，仅用于错误提示。
-
-    Returns:
-        标准化后的 temperature；未传时返回 ``None``。
-
-    Raises:
-        SystemExit: 当 temperature 非法时退出。
-    """
-
-    try:
-        return normalize_temperature(raw_value, field_name=field_name)
-    except ValueError as exc:
-        Log.error(str(exc), module=MODULE)
-        raise SystemExit(2) from exc
-
-
-def load_running_config(args, paths_config: WorkspaceConfig) -> RunningConfig:
+def load_running_config(args: argparse.Namespace, paths_config: WorkspaceConfig) -> RunningConfig:
     """通过启动期依赖解析并返回默认执行选项。
 
     Args:
@@ -578,15 +451,19 @@ def _prepare_cli_default_execution_options(
         无。
     """
 
-    paths = prepare_startup_paths(
+    paths = resolve_startup_paths(
         workspace_root=workspace_config.workspace_dir,
         config_root=workspace_config.config_root,
     )
-    resolver = prepare_config_file_resolver(config_root=paths.config_root)
-    config_loader = prepare_config_loader(resolver=resolver)
-    return prepare_default_execution_options(
-        workspace_root=paths.workspace_root,
-        config_loader=config_loader,
+    resolver = ConfigFileResolver(paths.config_root)
+    config_loader = ConfigLoader(resolver)
+    base_execution_options = build_base_execution_options(
+        workspace_dir=paths.workspace_root,
+        run_config=config_loader.load_run_config(),
+    )
+    return merge_execution_options(
+        base_options=base_execution_options,
+        workspace_dir=paths.workspace_root,
         execution_options=execution_options,
     )
 
@@ -621,57 +498,19 @@ def _prepare_cli_host_dependencies(
         无。
     """
 
-    paths = prepare_startup_paths(
+    prepared = prepare_host_runtime_dependencies(
         workspace_root=workspace_config.workspace_dir,
         config_root=workspace_config.config_root,
-    )
-    resolver = prepare_config_file_resolver(config_root=paths.config_root)
-    config_loader = prepare_config_loader(resolver=resolver)
-    prompt_asset_store = prepare_prompt_asset_store(resolver=resolver)
-    workspace = prepare_workspace_resources(
-        paths=paths,
-        config_loader=config_loader,
-        prompt_asset_store=prompt_asset_store,
-    )
-    model_catalog = prepare_model_catalog(config_loader=config_loader)
-    default_execution_options = prepare_default_execution_options(
-        workspace_root=paths.workspace_root,
-        config_loader=config_loader,
         execution_options=execution_options,
-    )
-    scene_execution_acceptance_preparer = prepare_scene_execution_acceptance_preparer(
-        workspace_root=paths.workspace_root,
-        default_execution_options=default_execution_options,
-        model_catalog=model_catalog,
-        prompt_asset_store=prompt_asset_store,
-    )
-    fins_runtime = prepare_fins_runtime(workspace_root=paths.workspace_root)
-    run_config = config_loader.load_run_config()
-    host_config = resolve_host_config(
-        workspace_root=paths.workspace_root,
-        run_config=run_config,
-        explicit_lane_config=None,
-    )
-    host = Host(
-        workspace=workspace,
-        model_catalog=model_catalog,
-        default_execution_options=default_execution_options,
-        host_store_path=host_config.store_path,
-        lane_config=host_config.lane_config,
-        pending_turn_resume_max_attempts=host_config.pending_turn_resume_max_attempts,
-        event_bus=None,
-    )
-    recover_host_startup_state(
-        HostAdminService(host=host),
         runtime_label="CLI Host runtime",
         log_module=MODULE,
     )
     return (
-        workspace,
-        default_execution_options,
-        scene_execution_acceptance_preparer,
-        host,
-        fins_runtime,
+        prepared.workspace,
+        prepared.default_execution_options,
+        prepared.scene_execution_acceptance_preparer,
+        prepared.host,
+        prepared.fins_runtime,
     )
 
 
@@ -793,20 +632,23 @@ def _build_fins_ops_service(args: argparse.Namespace) -> FinsService:
     )
 
 
-def setup_model_name(args) -> ModelName:
-    """
-    构建模型配置（从 CLI 获取）
+def setup_model_name(args: argparse.Namespace) -> ModelName:
+    """从 CLI 参数构建模型名称。
 
     Args:
-        args: 命令行参数对象
+        args: 命令行参数对象。
 
     Returns:
-        ModelConfig: 模型配置对象
+        ModelName 实例。
+
+    Raises:
+        无。
     """
+
     return ModelName(model_name=str(getattr(args, "model_name", "") or "").strip())
 
 
-def setup_write_config(args, paths_config: WorkspaceConfig, running_config: RunningConfig) -> WriteCliConfig:
+def setup_write_config(args: argparse.Namespace, paths_config: WorkspaceConfig, running_config: RunningConfig) -> WriteCliConfig:
     """构建写作模式配置。
 
     Args:
@@ -822,7 +664,7 @@ def setup_write_config(args, paths_config: WorkspaceConfig, running_config: Runn
     """
 
     raw_output = getattr(args, "output", None)
-    raw_template = getattr(args, "template", "./定性分析模板.md")
+    raw_template = getattr(args, "template", None)
     raw_write_max_retries = int(getattr(args, "write_max_retries", 2))
     raw_resume = bool(getattr(args, "resume", True))
     raw_web_provider = getattr(args, "web_provider", None)
@@ -839,9 +681,12 @@ def setup_write_config(args, paths_config: WorkspaceConfig, running_config: Runn
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    template_path = Path(raw_template).expanduser()
-    if not template_path.is_absolute():
-        template_path = (Path.cwd() / template_path).resolve()
+    if raw_template is not None:
+        template_path = Path(raw_template).expanduser()
+        if not template_path.is_absolute():
+            template_path = (Path.cwd() / template_path).resolve()
+    else:
+        template_path = _resolve_default_write_template_path(paths_config.workspace_dir)
     if not template_path.exists() or not template_path.is_file():
         Log.error(f"模板文件不存在: {template_path}", module=MODULE)
         raise SystemExit(2)
@@ -863,6 +708,25 @@ def setup_write_config(args, paths_config: WorkspaceConfig, running_config: Runn
         force=raw_force,
         infer=raw_infer,
     )
+
+
+def _resolve_default_write_template_path(workspace_dir: Path) -> Path:
+    """解析默认写作模板路径。
+
+    Args:
+        workspace_dir: 工作区根目录。
+
+    Returns:
+        优先使用工作区模板；若不存在，则返回包内默认模板路径。
+
+    Raises:
+        无。
+    """
+
+    workspace_template = workspace_dir / "assets" / "定性分析模板.md"
+    if workspace_template.exists():
+        return workspace_template
+    return resolve_package_assets_path() / "定性分析模板.md"
 
 
 def _resolve_write_output_dir(*, workspace_dir: Path, ticker: str | None, raw_output: str | None) -> Path:
@@ -888,7 +752,7 @@ def _resolve_write_output_dir(*, workspace_dir: Path, ticker: str | None, raw_ou
     return default_output_dir
 
 
-def setup_loglevel(args):
+def setup_loglevel(args: argparse.Namespace) -> None:
     """根据命令行参数设置日志级别。
 
     Args:

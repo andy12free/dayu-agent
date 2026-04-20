@@ -59,7 +59,7 @@ from .tool_result import (
     is_tool_success,
     project_for_llm,
 )
-from .cancellation import CancellationToken
+from dayu.contracts.cancellation import CancellationToken
 from .tool_trace import ToolTraceRecorder, ToolTraceRecorderFactory
 
 DEFAULT_FALLBACK_PROMPT = (
@@ -136,9 +136,11 @@ def _build_messages_from_prompt(
         可直接传给 Runner 的 messages 列表。
 
     Raises:
-        无。
+        ValueError: prompt 为空字符串时。
     """
 
+    if not prompt.strip():
+        raise ValueError("prompt 不能为空")
     messages: List[AgentMessage] = []
     normalized_system_prompt = _normalize_system_prompt(system_prompt)
     if normalized_system_prompt:
@@ -458,8 +460,15 @@ class AsyncAgent:
         trace_recorder: Optional[ToolTraceRecorder] = None,
         **extra_payloads,
     ) -> AsyncIterator[StreamEvent]:
-        """
-        统一推理循环（供 streaming / non-streaming 复用）
+        """统一推理循环（供 streaming / non-streaming 复用）。
+
+        .. note::
+
+            本方法约 550 行，承担了 tool batch / continuation / compaction /
+            duplicate detection / force answer 全部逻辑。已知需要拆分为更小的
+            子方法（_handle_tool_batch / _handle_continuation / _handle_compaction 等），
+            但因改动面大、与 AsyncRunner 交互紧密，暂不在常规修复批次中处理。
+            参见 code-review H1。
         """
         run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
         session_id = session_id or run_id
@@ -484,7 +493,7 @@ class AsyncAgent:
         # iteration_counter 单调递增，不受 context_overflow 回退影响，保证 iteration_id 全局唯一。
         iteration_counter = 0
         iteration_id = f"{run_id}_iteration_0"
-        # Bug #2 fix: 跨轮次累积内容，确保续写场景下 final_answer_event 包含完整内容
+        # 跨轮次累积内容，确保续写场景下 final_answer_event 包含完整内容
         accumulated_content_parts: List[str] = []
         
         while iteration < self.running_config.max_iterations:
@@ -581,10 +590,9 @@ class AsyncAgent:
                     tool_name = tool_calls_data[tool_call_id]["name"]
                     tool_args = tool_calls_data[tool_call_id]["arguments"]
                     result = tool_calls_data[tool_call_id].get("result", {})
-                    get_dup_call_spec = getattr(self.tool_executor, "get_dup_call_spec", None)
-                    dup_call_spec = (
-                        cast(Optional[DupCallSpec], get_dup_call_spec(tool_name))
-                        if callable(get_dup_call_spec)
+                    dup_call_spec: DupCallSpec | None = (
+                        cast(DupCallSpec | None, self.tool_executor.get_dup_call_spec(tool_name))
+                        if self.tool_executor is not None
                         else None
                     )
                     duplicate_decision = duplicate_call_guard.evaluate(
@@ -625,7 +633,7 @@ class AsyncAgent:
                     # 更新预算状态
                     usage = done_event_summary.get("usage")
                     if usage and isinstance(usage, dict):
-                        budget_state.update_usage(usage)
+                        budget_state.record_usage(usage)
                         if trace_recorder is not None:
                             trace_recorder.record_iteration_usage(
                                 iteration_id=iteration_id,
@@ -757,7 +765,7 @@ class AsyncAgent:
                 messages.append(assistant_message)
                 
                 # Pass 1: 序列化所有工具结果
-                serialized_pairs: List[Tuple[Dict, str]] = []
+                serialized_pairs: list[tuple[dict[str, object], str]] = []
                 for tc in ordered_tool_calls:
                     tool_result = tc.get("result")
                     if tool_result is None:
@@ -804,9 +812,10 @@ class AsyncAgent:
                 for tc, result_str in serialized_pairs:
                     if not result_str:
                         continue
+                    tool_call_id = str(tc["id"])
                     messages.append(
                         build_tool_chat_message(
-                            tool_call_id=tc["id"],
+                            tool_call_id=tool_call_id,
                             content=result_str,
                         )
                     )
@@ -900,7 +909,7 @@ class AsyncAgent:
                         run_id=run_id, iteration_id=iteration_id,
                     )
                     Log.warn(f"[{iteration_id}] {continuation_msg}", module=MODULE)
-                    # Bug #2 fix: 将截断的部分内容累积到跨轮缓冲
+                    # 将截断的部分内容累积到跨轮缓冲
                     if final_content:
                         accumulated_content_parts.append(final_content)
                     # 将截断的部分内容作为 assistant message
@@ -1228,13 +1237,7 @@ class AsyncAgent:
             return []
         if not self.runner.is_supports_tool_calling():
             return []
-        get_schemas = getattr(self.tool_executor, "get_schemas", None)
-        if not callable(get_schemas):
-            return []
-        raw_schemas = get_schemas()
-        if not isinstance(raw_schemas, list):
-            return []
-        return [schema for schema in raw_schemas if isinstance(schema, dict)]
+        return self.tool_executor.get_schemas()
 # ---------- 消息压缩工具函数 ----------
 
 

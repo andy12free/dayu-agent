@@ -9,8 +9,9 @@ from typing import Any, cast
 
 import pytest
 
+from dayu.contracts.model_config import OpenAICompatibleModelConfig
 from dayu.startup import config_loader as module
-from dayu.startup.config_file_resolver import ConfigFileResolver, _resolve_package_config_path
+from dayu.startup.config_file_resolver import ConfigFileResolver, resolve_package_config_path
 
 
 @pytest.mark.unit
@@ -36,7 +37,7 @@ def test_env_var_replacer_warns_when_missing(monkeypatch: pytest.MonkeyPatch) ->
         captured["message"] = message
         captured["module"] = module
 
-    monkeypatch.setattr(module.Log, "warn", _fake_warn)
+    monkeypatch.setattr(module.Log, "warning", _fake_warn)
     match = re.search(r"\{\{([A-Z_][A-Z0-9_]*)\}\}", "{{MISSING_TOKEN}}")
     assert match is not None
 
@@ -54,7 +55,7 @@ def test_config_loader_init_branches(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     loader_default = module.ConfigLoader(ConfigFileResolver())
     assert len(loader_default._resolver.config_dirs) == 1
 
-    package_config_path = _resolve_package_config_path()
+    package_config_path = resolve_package_config_path()
     loader_same = module.ConfigLoader(ConfigFileResolver(package_config_path))
     assert loader_same._resolver.config_dirs == [package_config_path]
 
@@ -88,7 +89,7 @@ def test_config_file_resolver_read_text_required_and_optional_branches(
     assert resolver.read_text("optional_missing.json", required=False) is None
     assert warnings
 
-    app_config_resolver = ConfigFileResolver(_resolve_package_config_path())
+    app_config_resolver = ConfigFileResolver(resolve_package_config_path())
     with pytest.raises(FileNotFoundError, match="查找路径"):
         app_config_resolver.read_text("also_missing.json", required=True)
 
@@ -97,7 +98,7 @@ def test_config_file_resolver_read_text_required_and_optional_branches(
 def test_config_file_resolver_read_json_optional_none_and_decode_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """验证 ConfigFileResolver JSON 解析的 None 与失败分支。"""
 
-    resolver = ConfigFileResolver(_resolve_package_config_path())
+    resolver = ConfigFileResolver(resolve_package_config_path())
 
     monkeypatch.setattr(resolver, "read_text", lambda filename, required=True: None)
     assert resolver.read_json("x.json", required=False) is None
@@ -217,7 +218,7 @@ def test_collect_model_referenced_env_vars_only_scans_selected_models(tmp_path: 
 def test_load_run_config_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:
     """验证 run.json 顶层不是对象时会显式失败。"""
 
-    resolver = ConfigFileResolver(_resolve_package_config_path())
+    resolver = ConfigFileResolver(resolve_package_config_path())
     monkeypatch.setattr(resolver, "read_json", lambda filename, required=True: ["bad"])
 
     loader = module.ConfigLoader(resolver)
@@ -230,7 +231,7 @@ def test_load_run_config_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> 
 def test_load_llm_models_rejects_non_object_model_entry(monkeypatch: pytest.MonkeyPatch) -> None:
     """验证 llm_models.json 中单个模型配置不是对象时会显式失败。"""
 
-    resolver = ConfigFileResolver(_resolve_package_config_path())
+    resolver = ConfigFileResolver(resolve_package_config_path())
     monkeypatch.setattr(
         resolver,
         "read_json",
@@ -247,7 +248,7 @@ def test_load_llm_models_rejects_non_object_model_entry(monkeypatch: pytest.Monk
 def test_load_llm_models_ignores_metadata_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """验证 llm_models.json 顶层元信息键不会被当成模型配置。"""
 
-    resolver = ConfigFileResolver(_resolve_package_config_path())
+    resolver = ConfigFileResolver(resolve_package_config_path())
     monkeypatch.setattr(
         resolver,
         "read_json",
@@ -283,10 +284,61 @@ def test_extract_env_var_names_and_should_scan_helpers(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+def test_collect_env_var_names_from_model_config_recurses_nested_values() -> None:
+    """模型环境变量收集应递归遍历嵌套 dict/list，而非依赖 JSON 序列化。"""
+
+    names = module._collect_env_var_names_from_model_config(
+        cast(
+            Any,
+            {
+                "endpoint_url": "{{BASE_URL}}",
+                "headers": [
+                    {"Authorization": "Bearer {{API_KEY}}"},
+                    {"X-Tags": ["{{TAG_ONE}}", "{{TAG_TWO}}"]},
+                ],
+                "metadata": {
+                    "notes": "use {{API_KEY}} and {{BASE_URL}}",
+                },
+            },
+        )
+    )
+
+    assert names == ("API_KEY", "BASE_URL", "TAG_ONE", "TAG_TWO")
+
+
+@pytest.mark.unit
+def test_load_llm_models_returns_deep_copy_of_cached_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """返回给调用方的模型配置副本不应污染内部缓存。"""
+
+    resolver = ConfigFileResolver(resolve_package_config_path())
+    monkeypatch.setattr(
+        resolver,
+        "read_json",
+        lambda filename, required=True: {
+            "demo_model": {
+                "runner_type": "openai_compatible",
+                "endpoint_url": "http://example.com",
+                "headers": {"Authorization": "Bearer token"},
+            }
+        },
+    )
+    loader = module.ConfigLoader(resolver)
+
+    first = loader.load_llm_models()
+    first_model = cast(OpenAICompatibleModelConfig, first["demo_model"])
+    first_model["headers"] = {"Authorization": "Bearer mutated"}
+    second = loader.load_llm_models()
+    second_model = cast(OpenAICompatibleModelConfig, second["demo_model"])
+    headers = second_model.get("headers")
+    assert headers is not None
+    assert headers["Authorization"] == "Bearer token"
+
+
+@pytest.mark.unit
 def test_load_llm_model_replaces_env_vars_and_reports_missing_model(monkeypatch: pytest.MonkeyPatch) -> None:
     """加载单模型时应替换环境变量，并在模型不存在时报错。"""
 
-    resolver = ConfigFileResolver(_resolve_package_config_path())
+    resolver = ConfigFileResolver(resolve_package_config_path())
     monkeypatch.setenv("TEST_API_KEY", "secret-token")
     monkeypatch.setattr(
         resolver,
@@ -320,7 +372,7 @@ def test_load_llm_model_replaces_env_vars_and_reports_missing_model(monkeypatch:
 def test_load_toolset_registrars_caches_and_validates_entries(monkeypatch: pytest.MonkeyPatch) -> None:
     """toolset registrar 加载应返回副本，并校验 key/value。"""
 
-    resolver = ConfigFileResolver(_resolve_package_config_path())
+    resolver = ConfigFileResolver(resolve_package_config_path())
     payload = {"doc": "dayu.engine.registrar:register"}
     monkeypatch.setattr(resolver, "read_json", lambda filename, required=True: payload)
 

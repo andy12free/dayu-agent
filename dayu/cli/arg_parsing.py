@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
-from dayu.cli.host_commands import register_host_subcommands
+from dayu.execution.cli_execution_options import add_execution_option_arguments
+
+if TYPE_CHECKING:
+    from dayu.execution.options import ExecutionOptionsOverridePayload
 
 
 
@@ -40,7 +43,6 @@ class DayuCliArgumentParser(argparse.ArgumentParser):
             self.print_help(sys.stderr)
             self.exit(2, "\n错误: 缺少子命令。请先选择一个子命令，再用 `--help` 查看该命令的具体参数。\n")
         super().error(message)
-
 
 def _add_global_args(parser: argparse.ArgumentParser) -> None:
     """追加各子命令共享的全局参数。
@@ -439,69 +441,7 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
         无。
     """
 
-    parser.add_argument(
-        "--web-provider",
-        type=str,
-        default=None,
-        choices=["auto", "tavily", "serper", "duckduckgo"],
-        help="联网检索 provider（默认读取 run.json.web_tools_config.provider，未配置时为 auto）",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=None,
-        help="模型 temperature（覆盖 llm_models.runtime_hints.temperature_profiles[scene.temperature_profile].temperature）",
-    )
-    parser.add_argument("--debug-sse", action="store_true", help="开启 SSE 高频调试日志（覆盖 run.json）")
-    parser.add_argument("--debug-tool-delta", action="store_true", help="开启工具调用参数增量日志（覆盖 run.json）")
-    parser.add_argument("--debug-sse-sample-rate", type=float, help="调试日志采样率（0-1，覆盖 run.json）")
-    parser.add_argument("--debug-sse-throttle-sec", type=float, help="调试日志节流窗口秒数（覆盖 run.json）")
-    parser.add_argument("--tool-timeout-seconds", type=float, help="工具执行超时时间（秒，覆盖 run.json）")
-    parser.add_argument(
-        "--enable-tool-trace",
-        action="store_true",
-        help="启用工具调用请求/返回 JSONL 追踪（覆盖 run.json）",
-    )
-    parser.add_argument(
-        "--tool-trace-dir",
-        type=str,
-        help="工具调用追踪输出目录（可相对 workspace，覆盖 run.json）",
-    )
-    parser.add_argument("--max-iterations", type=int, help="Agent 最大迭代次数（覆盖 run.json）")
-    parser.add_argument(
-        "--fallback-mode",
-        type=str,
-        choices=["force_answer", "raise_error"],
-        help="超限处理模式（覆盖 run.json）",
-    )
-    parser.add_argument("--fallback-prompt", type=str, help="超限时补充提示（覆盖 run.json）")
-    parser.add_argument(
-        "--max-consecutive-failed-tool-batches",
-        type=int,
-        help="连续失败工具批次上限（覆盖 run.json）",
-    )
-    parser.add_argument(
-        "--max-duplicate-tool-calls",
-        type=int,
-        help="同一工具无信息增量重复调用的连续上限（覆盖 run.json）",
-    )
-    parser.add_argument(
-        "--duplicate-tool-hint-prompt",
-        type=str,
-        help="检测到重复工具调用时注入给模型的提示词（覆盖 run.json）",
-    )
-    parser.add_argument(
-        "--doc-limits-json",
-        type=str,
-        default=None,
-        help="文档工具 limits 覆盖 JSON（覆盖 run.json.doc_tool_limits）",
-    )
-    parser.add_argument(
-        "--fins-limits-json",
-        type=str,
-        default=None,
-        help="财报工具 limits 覆盖 JSON（覆盖 run.json.fins_tool_limits）",
-    )
+    add_execution_option_arguments(parser)
 
 
 def _add_thinking_args(parser: argparse.ArgumentParser) -> None:
@@ -547,8 +487,8 @@ def _add_write_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--template",
         type=str,
-        default="./定性分析模板.md",
-        help="写作模板文件路径（默认: ./定性分析模板.md）",
+        default=None,
+        help="写作模板文件路径（默认: workspace/assets/定性分析模板.md，回退 dayu/assets/定性分析模板.md）",
     )
     parser.add_argument(
         "--output",
@@ -697,9 +637,49 @@ def _create_parser() -> argparse.ArgumentParser:
     _add_overwrite_arg(init_parser, help_text="覆盖已有配置文件")
 
     # 宿主管理子命令
-    register_host_subcommands(subparsers, add_global_args=_add_global_args)
+    _register_host_subcommands(subparsers)
 
     return parser
+
+
+def _register_host_subcommands(subparsers: argparse._SubParsersAction[DayuCliArgumentParser]) -> None:
+    """注册宿主管理子命令的参数定义。
+
+    这里仅保留 argparse 结构，避免 ``--help``/``parse_args`` 阶段
+    提前导入宿主运行时实现模块。
+
+    Args:
+        subparsers: 顶层子命令注册器。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    sessions_parser = subparsers.add_parser("sessions", help="管理会话")
+    _add_global_args(sessions_parser)
+    sessions_parser.add_argument("--all", action="store_true", dest="show_all", help="列出全部会话（含已关闭）")
+    sessions_subparsers = sessions_parser.add_subparsers(dest="sessions_action")
+    close_parser = sessions_subparsers.add_parser("close", help="关闭会话")
+    close_parser.add_argument("session_id", help="要关闭的 session ID")
+
+    runs_parser = subparsers.add_parser("runs", help="管理运行记录")
+    _add_global_args(runs_parser)
+    runs_parser.add_argument("--all", action="store_true", dest="show_all", help="列出全部 run（含已完成）")
+    runs_parser.add_argument("--session", dest="session_id", help="按 session 过滤")
+
+    cancel_parser = subparsers.add_parser("cancel", help="取消运行")
+    _add_global_args(cancel_parser)
+    cancel_parser.add_argument("run_id", nargs="?", help="要取消的 run ID")
+    cancel_parser.add_argument("--session", dest="session_id", help="取消 session 下所有活跃 run")
+
+    host_parser = subparsers.add_parser("host", help="宿主维护")
+    _add_global_args(host_parser)
+    host_subparsers = host_parser.add_subparsers(dest="host_action")
+    host_subparsers.add_parser("cleanup", help="清理孤儿 run 和过期 permit")
+    host_subparsers.add_parser("status", help="显示宿主状态")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -717,3 +697,83 @@ def parse_arguments() -> argparse.Namespace:
 
     return _create_parser().parse_args()
 
+
+# ---------------------------------------------------------------------------
+# CLI 参数解析共享工具函数
+# ---------------------------------------------------------------------------
+
+def parse_limits_override(
+    raw_json: str | None,
+    *,
+    field_name: str,
+) -> "ExecutionOptionsOverridePayload | None":
+    """解析工具 limits JSON 覆盖字符串。
+
+    将 CLI / WeChat 等入口传入的 JSON 字符串解析为
+    ``ExecutionOptionsOverridePayload``，校验值类型（仅允许标量）。
+
+    Args:
+        raw_json: 原始 JSON 字符串；``None`` 表示未提供。
+        field_name: 当前参数名，用于错误提示。
+
+    Returns:
+        归一化后的覆盖字典；未提供时返回 ``None``。
+
+    Raises:
+        SystemExit: 当 JSON 非法、不是对象或包含非标量值时退出。
+    """
+
+    if raw_json is None:
+        return None
+    import json
+
+    from dayu.execution.options import ExecutionOptionsOverridePayload
+    from dayu.log import Log
+
+    try:
+        parsed = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        Log.error(f"{field_name} 不是合法 JSON: {exc}", module=_PARSE_MODULE)
+        raise SystemExit(2) from exc
+    if not isinstance(parsed, dict):
+        Log.error(f"{field_name} 必须是 JSON 对象", module=_PARSE_MODULE)
+        raise SystemExit(2)
+    normalized: ExecutionOptionsOverridePayload = {}
+    for key, value in parsed.items():
+        if value is None or isinstance(value, str | int | float | bool):
+            normalized[str(key)] = value
+            continue
+        Log.error(f"{field_name} 只允许 JSON 标量值，字段 {key!r} 非法", module=_PARSE_MODULE)
+        raise SystemExit(2)
+    return normalized
+
+
+def parse_temperature_argument(
+    raw_value: str | int | float | None,
+    *,
+    field_name: str,
+) -> float | None:
+    """解析 temperature 参数。
+
+    Args:
+        raw_value: 原始参数值。
+        field_name: 参数名，仅用于错误提示。
+
+    Returns:
+        标准化后的 temperature；未传时返回 ``None``。
+
+    Raises:
+        SystemExit: 当 temperature 非法时退出。
+    """
+
+    from dayu.execution.options import normalize_temperature
+    from dayu.log import Log
+
+    try:
+        return normalize_temperature(raw_value, field_name=field_name)
+    except ValueError as exc:
+        Log.error(str(exc), module=_PARSE_MODULE)
+        raise SystemExit(2) from exc
+
+
+_PARSE_MODULE = "CLI.ARGS"

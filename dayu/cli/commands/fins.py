@@ -29,24 +29,13 @@ from dayu.contracts.fins import (
     UploadFilingsFromCommandPayload,
     UploadMaterialCommandPayload,
 )
-from dayu.fins.command_helpers import coerce_document_ids_input, prepare_cli_args
+from dayu.fins.cli import _coerce_document_ids_input as coerce_document_ids_input, _prepare_cli_args as prepare_cli_args
 from dayu.log import Log
 from dayu.presenters import format_fins_cli_result
 from dayu.services.contracts import FinsSubmitRequest
 
-from dayu.cli.dependency_setup import MODULE, _build_fins_ops_service
-
-
-
-_FINS_COMMANDS = {
-    "download",
-    "upload_filing",
-    "upload_filings_from",
-    "upload_material",
-    "process",
-    "process_filing",
-    "process_material",
-}
+from dayu.cli.command_names import FINS_COMMANDS
+from dayu.cli.dependency_setup import MODULE, _build_fins_ops_service, setup_loglevel
 
 
 def _build_fins_command(args: argparse.Namespace) -> FinsCommand:
@@ -63,7 +52,7 @@ def _build_fins_command(args: argparse.Namespace) -> FinsCommand:
     """
 
     command_name = str(args.command)
-    if command_name not in _FINS_COMMANDS:
+    if command_name not in FINS_COMMANDS:
         raise ValueError(f"不是财报命令: {command_name}")
     prepare_cli_args(args)
     if command_name == FinsCommandName.DOWNLOAD:
@@ -257,7 +246,7 @@ async def _consume_fins_stream(
     return final_result
 
 
-def _run_fins_command(args: argparse.Namespace) -> int:
+def run_fins_command(args: argparse.Namespace) -> int:
     """执行财报命令并输出结果。
 
     Args:
@@ -271,6 +260,7 @@ def _run_fins_command(args: argparse.Namespace) -> int:
     """
 
     try:
+        setup_loglevel(args)
         service = _build_fins_ops_service(args)
         command = _build_fins_command(args)
         submission = service.submit(FinsSubmitRequest(command=command))
@@ -288,4 +278,3 @@ def _run_fins_command(args: argparse.Namespace) -> int:
         return 1
     print(format_fins_cli_result(command.name, result))
     return 0
-

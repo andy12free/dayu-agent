@@ -1,52 +1,268 @@
 name: CI
 
-# 触发条件：
-# - push 到 main：保证主线始终可知状态。
-# - pull_request：所有进入 main 的改动必须先跑过测试。
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      run_extended_integration:
+        description: "是否运行扩展 integration 层"
+        required: false
+        default: false
+        type: boolean
+      run_full_matrix:
+        description: "是否运行完整平台验证"
+        required: false
+        default: false
+        type: boolean
+      include_macos_x64:
+        description: "完整平台验证时是否额外运行 macos-x64"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "0 2 * * *"
 
-# 并发控制：同一个 ref 的多次推送/rebase 只保留最新一次 CI 在跑，避免浪费 runner。
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        python-version: ["3.11", "3.12"]
+  pr-required-min-compat:
+    name: pr-required min-compat (ubuntu-latest, py3.11)
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
           cache: pip
 
-      - name: Install dependencies
-        # 装 browser extra 只是为了让 pyright 能 resolve playwright / playwright-stealth 的可选 import；
-        # 不执行 `playwright install chromium`，CI 不跑浏览器端到端测试。
+      - name: Install minimum supported dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test,dev,browser]"
+          pip install -e ".[test,dev,browser]" -c constraints/min-py311.txt
 
       - name: Run pyright
-        # pyright 的跨平台类型分析依赖 sys.platform narrowing，对 Windows 侧测试文件
-        # （如 tests/application/test_wechat_service_manager.py）仍会报 POSIX 符号缺失；
-        # WeChat service 本身也只支持 macOS/Linux。Windows 端类型覆盖收益有限，只在 Ubuntu 跑。
-        if: runner.os == 'Linux'
         run: pyright
 
-      - name: Run pytest
+      - name: Run required pytest lane
+        run: pytest -q --timeout=60 -m "not integration and not slow and not e2e"
+
+  pr-required-lock-smoke:
+    name: pr-required lock-smoke (linux-x64, py3.11)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install locked dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,dev,browser]" -c constraints/lock-linux-x64-py311.txt
+
+      - name: Run required Docling integration smoke
+        run: |
+          pytest -q --timeout=120 \
+            tests/engine/test_docling_processor_integration.py \
+            tests/fins/test_docling_upload_service_integration.py \
+            tests/engine/test_web_fetch_docling_integration.py
+
+      - name: Build wheel
+        run: python -m pip wheel --no-deps --wheel-dir dist .
+
+      - name: Build offline bundle
+        shell: bash
+        run: |
+          WHEEL_PATH="$(python - <<'PY'
+          from pathlib import Path
+          wheels = sorted(Path("dist").glob("dayu_agent-*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"unexpected wheels: {wheels}")
+          print(wheels[0])
+          PY
+          )"
+          BUNDLE_PATH="$(python utils/build_offline_bundle.py \
+            --wheel "$WHEEL_PATH" \
+            --constraints constraints/lock-linux-x64-py311.txt \
+            --platform-id "linux-x64" \
+            --output-dir dist/offline)"
+          echo "BUNDLE_PATH=$BUNDLE_PATH" >> "$GITHUB_ENV"
+
+      - name: Smoke test offline bundle
+        run: python utils/smoke_test_offline_bundle.py --archive "${{ env.BUNDLE_PATH }}"
+
+  extended-integration:
+    name: extended integration (ubuntu-latest, py3.11)
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+        (inputs.run_extended_integration == true || inputs.run_full_matrix == true)) ||
+      (github.event_name == 'pull_request' &&
+        contains(github.event.pull_request.labels.*.name, 'full-integration'))
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install locked dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,dev,browser]" -c constraints/lock-linux-x64-py311.txt
+
+      - name: Run extended integration lane
+        run: pytest -q --timeout=120 -m "integration and not e2e"
+
+  full-platform-validation:
+    name: full-platform-validation (${{ matrix.platform_id }}, py3.11)
+    runs-on: ${{ matrix.runner }}
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+        inputs.run_full_matrix == true) ||
+      (github.event_name == 'pull_request' &&
+        contains(github.event.pull_request.labels.*.name, 'full-integration') &&
+        true)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            platform_id: macos-arm64
+          - runner: ubuntu-latest
+            platform_id: linux-x64
+          - runner: windows-latest
+            platform_id: windows-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install locked dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          CONSTRAINTS="constraints/lock-${{ matrix.platform_id }}-py311.txt"
+          pip install -e ".[test,dev,browser]" -c "$CONSTRAINTS"
+
+      - name: Run pyright
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            pyright --pythonplatform Linux
+          else
+            pyright
+          fi
+
+      - name: Run full pytest lane
         run: pytest -q --timeout=60
+
+      - name: Build wheel
+        run: python -m pip wheel --no-deps --wheel-dir dist .
+
+      - name: Build offline bundle
+        shell: bash
+        run: |
+          CONSTRAINTS="constraints/lock-${{ matrix.platform_id }}-py311.txt"
+          WHEEL_PATH="$(python - <<'PY'
+          from pathlib import Path
+          wheels = sorted(Path("dist").glob("dayu_agent-*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"unexpected wheels: {wheels}")
+          print(wheels[0])
+          PY
+          )"
+          BUNDLE_PATH="$(python utils/build_offline_bundle.py \
+            --wheel "$WHEEL_PATH" \
+            --constraints "$CONSTRAINTS" \
+            --platform-id "${{ matrix.platform_id }}" \
+            --output-dir dist/offline)"
+          echo "BUNDLE_PATH=$BUNDLE_PATH" >> "$GITHUB_ENV"
+
+      - name: Smoke test offline bundle
+        run: python utils/smoke_test_offline_bundle.py --archive "${{ env.BUNDLE_PATH }}"
+
+  full-platform-validation-macos-x64:
+    name: full-platform-validation (macos-x64, py3.11)
+    runs-on: macos-13
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      inputs.run_full_matrix == true &&
+      inputs.include_macos_x64 == true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install locked dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,dev,browser]" -c constraints/lock-macos-x64-py311.txt
+
+      - name: Run pyright
+        run: pyright
+
+      - name: Run full pytest lane
+        run: pytest -q --timeout=60
+
+      - name: Build wheel
+        run: python -m pip wheel --no-deps --wheel-dir dist .
+
+      - name: Build offline bundle
+        shell: bash
+        run: |
+          WHEEL_PATH="$(python - <<'PY'
+          from pathlib import Path
+          wheels = sorted(Path("dist").glob("dayu_agent-*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"unexpected wheels: {wheels}")
+          print(wheels[0])
+          PY
+          )"
+          BUNDLE_PATH="$(python utils/build_offline_bundle.py \
+            --wheel "$WHEEL_PATH" \
+            --constraints constraints/lock-macos-x64-py311.txt \
+            --platform-id "macos-x64" \
+            --output-dir dist/offline)"
+          echo "BUNDLE_PATH=$BUNDLE_PATH" >> "$GITHUB_ENV"
+
+      - name: Smoke test offline bundle
+        run: python utils/smoke_test_offline_bundle.py --archive "${{ env.BUNDLE_PATH }}"

@@ -39,11 +39,32 @@ from dayu.contracts.execution_metadata import ExecutionDeliveryContext, normaliz
 from dayu.contracts.events import AppEvent, AppEventType, AppResult, PublishedRunEventProtocol
 from dayu.contracts.run import RunCancelReason, RunRecord, RunState
 from dayu.engine.events import EventType
+from dayu.engine.tool_result import project_for_llm
+from dayu.host.conversation_store import ConversationToolUseSummary
 from dayu.log import Log
 
 TStreamEvent = TypeVar("TStreamEvent", bound=PublishedRunEventProtocol)
 TSyncResult = TypeVar("TSyncResult")
 MODULE = "HOST.EXECUTOR"
+_DEFAULT_CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS = 300.0
+
+
+def _resolve_concurrency_acquire_timeout_seconds(timeout_ms: int | None) -> float:
+    """解析并发 permit 获取超时。
+
+    Args:
+        timeout_ms: run 级超时毫秒数。
+
+    Returns:
+        permit 获取最大等待秒数；未配置 run 超时时返回默认值。
+
+    Raises:
+        无。
+    """
+
+    if timeout_ms is None:
+        return _DEFAULT_CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS
+    return max(0.001, timeout_ms / 1000.0)
 
 
 class RunDeadlineWatcher:
@@ -81,34 +102,39 @@ class RunDeadlineWatcher:
         self._token = token
         self._timeout_ms = timeout_ms
         self._timer: threading.Timer | None = None
+        self._timer_lock = threading.Lock()
 
     def start(self) -> None:
         """启动 watcher。幂等。"""
 
-        if self._timeout_ms is None or self._timer is not None:
-            return
-        self._timer = threading.Timer(self._timeout_ms / 1000.0, self._on_timeout)
-        self._timer.daemon = True
-        self._timer.name = f"run-deadline-{self._run_id}"
-        self._timer.start()
+        with self._timer_lock:
+            if self._timeout_ms is None or self._timer is not None:
+                return
+            timer = threading.Timer(self._timeout_ms / 1000.0, self._on_timeout)
+            timer.daemon = True
+            timer.name = f"run-deadline-{self._run_id}"
+            self._timer = timer
+        timer.start()
 
     def stop(self) -> None:
         """停止 watcher。幂等。"""
 
-        if self._timer is None:
-            return
-        self._timer.cancel()
-        self._timer = None
+        with self._timer_lock:
+            timer = self._timer
+            self._timer = None
+        if timer is not None:
+            timer.cancel()
 
     def _on_timeout(self) -> None:
         """处理 deadline 到时。在 Timer 线程执行。"""
 
+        with self._timer_lock:
+            self._timer = None
         self._run_registry.request_cancel(
             self._run_id,
             cancel_reason=RunCancelReason.TIMEOUT,
         )
         self._token.cancel()
-        self._timer = None
 
 
 @dataclass
@@ -542,7 +568,10 @@ class DefaultHostExecutor(HostExecutorProtocol):
         self.run_registry.start_run(run_id)
         permit = None
         if self.concurrency_governor is not None and spec.concurrency_lane:
-            permit = self.concurrency_governor.acquire(spec.concurrency_lane)
+            permit = self.concurrency_governor.acquire(
+                spec.concurrency_lane,
+                timeout=_resolve_concurrency_acquire_timeout_seconds(spec.timeout_ms),
+            )
         return HostedRunContext(run_id=run_id, cancellation_token=token), bridge, deadline_watcher, permit
 
     def _finish_run(
@@ -948,7 +977,7 @@ def _build_cancelled_error(payload: Any) -> CancelledError:
     return CancelledError("操作已被取消")
 
 
-def _build_conversation_tool_use(payload: dict[str, Any]):
+def _build_conversation_tool_use(payload: dict[str, Any]) -> ConversationToolUseSummary:
     """把 tool_call_result 事件转成 transcript 摘要对象。
 
     Args:
@@ -960,8 +989,6 @@ def _build_conversation_tool_use(payload: dict[str, Any]):
     Raises:
         无。
     """
-
-    from dayu.host.conversation_store import ConversationToolUseSummary
 
     return ConversationToolUseSummary(
         name=str(payload.get("name") or ""),
@@ -982,8 +1009,6 @@ def _summarize_tool_result(result: Any) -> str:
     Raises:
         无。
     """
-
-    from dayu.engine.tool_result import project_for_llm
 
     projected = project_for_llm(result)
     serialized = json.dumps(projected, ensure_ascii=False, sort_keys=True)

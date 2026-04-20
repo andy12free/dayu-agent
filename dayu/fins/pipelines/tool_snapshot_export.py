@@ -19,6 +19,7 @@ from io import BytesIO
 from typing import Any, Callable, Mapping, Optional
 
 from dayu.contracts.cancellation import CancelledError
+from dayu.fins._converters import normalize_optional_text, require_non_empty_text
 from dayu.engine.processors.processor_registry import ProcessorRegistry
 from dayu.log import Log
 from dayu.fins.domain.document_models import ProcessedHandle
@@ -558,9 +559,12 @@ def export_tool_snapshot(
         ValueError: 入参不合法时抛出。
     """
 
-    normalized_ticker = _normalize_required_text(ticker)
-    normalized_document_id = _normalize_required_text(document_id)
-    normalized_expected_parser_signature = _normalize_required_text(expected_parser_signature)
+    normalized_ticker = require_non_empty_text(ticker, empty_error=ValueError("必填文本不能为空"))
+    normalized_document_id = require_non_empty_text(document_id, empty_error=ValueError("必填文本不能为空"))
+    normalized_expected_parser_signature = require_non_empty_text(
+        expected_parser_signature,
+        empty_error=ValueError("必填文本不能为空"),
+    )
     _raise_if_cancelled(
         ticker=normalized_ticker,
         document_id=normalized_document_id,
@@ -578,7 +582,7 @@ def export_tool_snapshot(
     )
 
     _, market = _read_company_info(repository=company_repository, ticker=normalized_ticker)
-    resolved_market = _normalize_optional_text(market_override) or market
+    resolved_market = normalize_optional_text(market_override) or market
     resolved_form_type = _normalize_form_type(source_meta.get("form_type", ""))
     resolved_document_type = resolve_document_type_for_source(
         form_type=source_meta.get("form_type", ""),
@@ -966,9 +970,12 @@ def _build_search_document_calls(
 
     calls: list[dict[str, Any]] = []
     for query_spec in search_query_specs:
-        query_id = _normalize_required_text(query_spec.get("query_id"))
-        query_text = _normalize_required_text(query_spec.get("query_text"))
-        query_intent = _normalize_required_text(query_spec.get("query_intent"))
+        query_id = require_non_empty_text(query_spec.get("query_id"), empty_error=ValueError("必填文本不能为空"))
+        query_text = require_non_empty_text(query_spec.get("query_text"), empty_error=ValueError("必填文本不能为空"))
+        query_intent = require_non_empty_text(
+            query_spec.get("query_intent"),
+            empty_error=ValueError("必填文本不能为空"),
+        )
         query_weight = float(query_spec.get("query_weight", DEFAULT_SEARCH_QUERY_WEIGHT))
         if query_weight <= 0:
             raise ValueError("search_query_specs.query_weight 必须大于 0")
@@ -1075,10 +1082,10 @@ def _build_query_xbrl_facts_call(
     fiscal_year = source_meta.get("fiscal_year")
     if isinstance(fiscal_year, int):
         request["fiscal_year"] = fiscal_year
-    fiscal_period = _normalize_optional_text(source_meta.get("fiscal_period"))
+    fiscal_period = normalize_optional_text(source_meta.get("fiscal_period"))
     if fiscal_period is not None:
         request["fiscal_period"] = fiscal_period
-    period_end = _normalize_optional_text(source_meta.get("report_date"))
+    period_end = normalize_optional_text(source_meta.get("report_date"))
     if period_end is not None:
         request["period_end"] = period_end
     return {"request": request, "response": service.query_xbrl_facts(**request)}
@@ -1164,10 +1171,10 @@ def _build_search_query_specs(
         ValueError: 查询文本无效时抛出。
     """
 
-    normalized_pack_name = _normalize_required_text(pack_name)
+    normalized_pack_name = require_non_empty_text(pack_name, empty_error=ValueError("必填文本不能为空"))
     specs: list[dict[str, Any]] = []
     for index, raw_query in enumerate(queries, start=1):
-        query_text = _normalize_required_text(raw_query)
+        query_text = require_non_empty_text(raw_query, empty_error=ValueError("必填文本不能为空"))
         query_id = f"{normalized_pack_name}.q{index:03d}"
         query_intent = _build_query_intent(query_text=query_text, index=index)
         specs.append(
@@ -1195,7 +1202,7 @@ def _build_query_intent(*, query_text: str, index: int) -> str:
         ValueError: 参数非法时抛出。
     """
 
-    _ = _normalize_required_text(query_text)
+    _ = require_non_empty_text(query_text, empty_error=ValueError("必填文本不能为空"))
     if index <= 0:
         raise ValueError("index 必须大于 0")
     normalized = re.sub(r"[^a-z0-9]+", "_", query_text.lower()).strip("_")
@@ -1217,7 +1224,7 @@ def _normalize_market(value: Any) -> str:
         RuntimeError: 标准化失败时抛出。
     """
 
-    normalized = _normalize_optional_text(value)
+    normalized = normalize_optional_text(value)
     if normalized is None:
         return SEARCH_QUERY_PACK_DEFAULT_MARKET
     upper_value = normalized.upper()
@@ -1239,11 +1246,11 @@ def _normalize_form_type(value: Any) -> str:
         RuntimeError: 标准化失败时抛出。
     """
 
-    normalized = _normalize_optional_text(value)
+    normalized = normalize_optional_text(value)
     if normalized is None:
         return ""
     normalized_form = normalize_form_type(normalized)
-    return _normalize_optional_text(normalized_form) or ""
+    return normalize_optional_text(normalized_form) or ""
 
 
 def _build_xbrl_concepts() -> list[str]:
@@ -1298,7 +1305,7 @@ def _collect_section_refs(*, sections_response: Mapping[str, Any]) -> list[str]:
     for item in sections:
         if not isinstance(item, Mapping):
             continue
-        raw_ref = _normalize_optional_text(item.get("ref"))
+        raw_ref = normalize_optional_text(item.get("ref"))
         if raw_ref is not None:
             section_refs.add(raw_ref)
     return sorted(section_refs)
@@ -1314,7 +1321,7 @@ def _collect_table_refs(*, list_tables_response: Mapping[str, Any]) -> list[str]
     for item in tables:
         if not isinstance(item, Mapping):
             continue
-        table_ref = _normalize_optional_text(item.get("table_ref"))
+        table_ref = normalize_optional_text(item.get("table_ref"))
         if table_ref is not None:
             table_refs.add(table_ref)
     return sorted(table_refs)
@@ -1384,8 +1391,14 @@ def _build_tool_snapshot_meta(
         ValueError: 搜索词包元信息不满足契约时抛出。
     """
 
-    normalized_pack_name = _normalize_required_text(search_query_pack_name)
-    normalized_pack_version = _normalize_required_text(search_query_pack_version)
+    normalized_pack_name = require_non_empty_text(
+        search_query_pack_name,
+        empty_error=ValueError("必填文本不能为空"),
+    )
+    normalized_pack_version = require_non_empty_text(
+        search_query_pack_version,
+        empty_error=ValueError("必填文本不能为空"),
+    )
     if search_query_count < 0:
         raise ValueError("search_query_count 不能为负数")
     if search_query_count != len(search_queries):
@@ -1465,7 +1478,7 @@ def _analyze_financial_statement_capability(
         if has_rows or has_periods:
             has_financial_statement = True
             has_financial_statement_sections = True
-        data_quality = _normalize_optional_text(response.get("data_quality"))
+        data_quality = normalize_optional_text(response.get("data_quality"))
         normalized_quality = data_quality.lower() if data_quality is not None else None
         if normalized_quality in {"xbrl", "extracted"} and (has_rows or has_periods):
             has_structured_financial_statements = True
@@ -1537,22 +1550,3 @@ def _extract_page_range(section: Mapping[str, Any]) -> Optional[list[int]]:
         return [start, end]
     return None
 
-
-def _normalize_optional_text(value: Any) -> Optional[str]:
-    """标准化可选文本。"""
-
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    if not normalized:
-        return None
-    return normalized
-
-
-def _normalize_required_text(value: Any) -> str:
-    """标准化必填文本。"""
-
-    normalized = _normalize_optional_text(value)
-    if normalized is None:
-        raise ValueError("必填文本不能为空")
-    return normalized

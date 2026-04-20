@@ -21,6 +21,40 @@
 - [fins/README.md](fins/README.md)
 - [config/README.md](config/README.md)
 
+## 0.1 开发环境安装
+
+开发环境以 Python 3.11 为基准。源码安装只面向开发者，不作为最终用户官方交付路径。建议直接使用受控 constraints 安装：
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[test,dev,browser]" -c constraints/lock-macos-arm64-py311.txt
+```
+
+说明：
+
+- macOS Intel 开发环境改用 `constraints/lock-macos-x64-py311.txt`
+- Linux 开发环境改用 `constraints/lock-linux-x64-py311.txt`
+- Windows 开发环境改用 `constraints/lock-windows-x64-py311.txt`
+
+
+如果为了专门验证最低支持边界，请使用：
+```bash
+pip install -e ".[test,dev,browser]" -c constraints/min-py311.txt
+```
+
+浏览器回退抓取是开发环境默认必备能力，因为它会直接影响 `web tools` 中 `fetch_web_page` 的表现；完成依赖安装后，还需要执行：
+
+```bash
+playwright install chromium
+```
+
+如需 PDF 渲染，还需要安装 `pandoc`。此外，渲染 HTML / PDF 仍建议安装 Google Chrome：
+
+- macOS：`brew install pandoc`
+- Ubuntu / Debian：`sudo apt-get install pandoc`
+- Windows：`choco install pandoc` 或从 [pandoc 官网](https://pandoc.org/installing.html) 下载安装
+
 ## 0. 如果你想参与项目
 - 定性分析模板 读起来机械感还很强，还没写出差异化：
   - 同一章节里，不同行业公司写出明显不同的判断路径。
@@ -104,8 +138,10 @@ flowchart LR
 - `UI`
   - 负责接入宿主入口，例如 `CLI / Web / FastAPI / WeChat`
   - 在启动期通过 `startup preparation` 拿稳定依赖
-  - 显式 `new Host(...)`
-  - 只向 `Host(...)` 传稳定输入，不显式构造 `SQLiteSessionRegistry`、`SQLiteRunRegistry`、`SQLiteConcurrencyGovernor`、`DefaultScenePreparer`、`DefaultHostExecutor`
+  - `dayu.cli` 当前固定拆成三层：`arg_parsing.py` 只负责参数定义，`main.py` 只负责顶层命令分发，`commands/` 负责各子命令执行；CLI 共享运行时装配真源继续集中在 `dependency_setup.py`
+  - `dayu.wechat` 当前也固定拆成四层：`arg_parsing.py` 只负责参数定义与上下文解析，`runtime.py` 只负责 WeChat 运行时装配与 service helper，`commands/` 负责 `login / run / service` 子命令执行，`main.py` 只负责顶层分发
+  - 调用 `dayu.services.startup_preparation` / `dayu.host.startup_preparation` 暴露的启动期 public API，收敛 `Host` 级稳定依赖
+  - 不复制 `Host` 装配链，也不显式构造 `SQLiteSessionRegistry`、`SQLiteRunRegistry`、`SQLiteConcurrencyGovernor`、`DefaultScenePreparer`、`DefaultHostExecutor`
   - 显式 `new Service(...)`
   - 宿主管理类 UI 命令也只消费窄 `Service`（如 `HostAdminService`），不在请求期直接调用 `Host` 方法
   - interactive / web / wechat 这类 UI 适配层只消费各自稳定 `ServiceProtocol` 已声明的方法，不保留 `hasattr` 兼容分支去探测旧接口；对多轮 Chat 入口，CLI interactive、Web 和 WeChat 统一只走 `submit_turn()` / `list_resumable_pending_turns()` / `resume_pending_turn()` 这组公开契约
@@ -142,9 +178,8 @@ sequenceDiagram
     participant SP as scene preparation
     participant Agent as AsyncAgent
 
-    UI->>Startup: prepare_* startup functions
-    Startup-->>UI: workspace/model/prompt/default execution options 稳定依赖
-    UI->>Host: new Host(...)
+    UI->>Startup: resolve_startup_paths / ConfigLoader / prepare_host_runtime_dependencies(...)
+    Startup-->>UI: workspace/model/prompt/default execution options/Host 稳定依赖
     UI->>Service: new PromptService(...)
     UI->>Service: submit(PromptRequest(user_text, ticker, session_id?, session_resolution_policy, execution_options))
     Service->>Host: resolve session(create_session() / touch_session())
@@ -255,7 +290,7 @@ sequenceDiagram
 
 ### 3.5 startup preparation
 
-`startup preparation` 位于 `startup/`，只服务于启动期，不进入请求期调用链。
+`startup preparation` 是启动期 public surface 的统称，当前分布在 `startup/`、`dayu.services.startup_preparation` 和 `dayu.host.startup_preparation`；它只服务于启动期，不进入请求期调用链。
 
 它负责：
 
@@ -264,7 +299,7 @@ sequenceDiagram
 - 准备 `ConfigLoader`、`PromptAssetStore`、`WorkspaceResources`、`ModelCatalog`
 - 准备默认 `ResolvedExecutionOptions`
 - 准备金融领域专用 `FinsRuntime`
-- 调用 `Service` 暴露的 startup preparation API，收敛 `SceneExecutionAcceptancePreparer`
+- 调用 `Service` 暴露的 startup preparation API，收敛 `SceneExecutionAcceptancePreparer` 与共享 Host runtime 依赖
 - 调用 `Host` 暴露的 startup preparation API，收敛 `HostStore path`、`lane config`
 - 支持 UI 先准备稳定依赖，再按命令分支惰性创建所需 `Service`
 
@@ -712,7 +747,7 @@ Host 是 Dayu 的通用托管执行层。它的价值不在于“帮 Service 调
 - 多轮会话托管能力：统一 transcript、memory、compaction 调度。
 - reply outbox 能力：把出站交付真源作为可选宿主能力托管。
 
-默认实现上，这些能力由 `Host` 内部拥有的一组子组件共同完成，例如 session registry、run registry、并发治理器、pending turn store、reply outbox store、event bus 和默认执行器；`UI` 只负责 `new Host(...)`，不负责拆开装配这些默认内部实现。
+默认实现上，这些能力由 `Host` 内部拥有的一组子组件共同完成，例如 session registry、run registry、并发治理器、pending turn store、reply outbox store、event bus 和默认执行器；`UI` 只消费启动期 public API 返回的 `Host`，不负责复制或拆开这些默认内部实现。
 
 ### 6.1 Session 能力
 
@@ -961,7 +996,7 @@ Scene 当前负责声明：
 
 这三层语义求交之后，`Host` 只做一件机械动作：按 `toolset_name -> registrar import path` 的安装清单加载对应 registrar，并把通用注册上下文交给它。当前安装清单来自 `toolset_registrars.json`，它不是第四层执行决策，也不负责放宽 scene / Service 已经收窄过的工具集合。
 
-这里的“通用注册上下文”已经进一步收紧为：`Host` 只把当前 `toolset_name` 命中的单个 `toolset_config` 快照、动态 `execution_permissions` 与工作区稳定资源交给 registrar；具体如何把 payload 反解成 `DocToolLimits / FinsToolLimits / WebToolsConfig`，由各包内 adapter 自己完成。
+这里的“通用注册上下文”已经进一步收紧为：`Host` 只把当前 `toolset_name` 命中的单个 `toolset_config` 快照、动态 `execution_permissions` 与工作区稳定资源交给 registrar；registrar 负责在 adapter 边界把这些通用输入适配成叶子 `register_*_tools(...)` 所需参数。共享的 limits/config 反序列化统一收口在 `dayu.contracts.tool_configs`，而像 doc 白名单解析这类 domain 规则则留在对应 toolset 的边界模块内部，不能再让 `Host` 直接解释。
 
 因此需要明确两点：
 
@@ -1238,9 +1273,8 @@ sequenceDiagram
     participant SP as scene preparation
     participant Agent as AsyncAgent
 
-    UI->>Startup: prepare_* startup functions
-    Startup-->>UI: workspace/model/runtime/default execution options 稳定依赖
-    UI->>Host: new Host(...)
+    UI->>Startup: resolve_startup_paths / ConfigLoader / prepare_host_runtime_dependencies(...)
+    Startup-->>UI: workspace/model/runtime/default execution options/Host 稳定依赖
     UI->>Service: new ChatService(host, scene_execution_acceptance_preparer, ...)
     UI->>Service: list_resumable_pending_turns(session_id, "interactive")
     Service->>Host: list_pending_turns(resumable_only=True)
@@ -1360,7 +1394,9 @@ sequenceDiagram
 1. `startup/`
 2. `services/`
 3. `host/`
-4. `cli/`、`web/`、`wechat/`
+4. `cli/arg_parsing.py` -> `cli/main.py` -> `cli/commands/`
+5. `wechat/arg_parsing.py` -> `wechat/runtime.py` -> `wechat/commands/` -> `wechat/main.py`
+6. `web/`
 
 对扩展开发者，建议按这个顺序读代码：
 

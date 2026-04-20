@@ -5,9 +5,24 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 import math
 from pathlib import Path
-from typing import Any, Mapping, Optional, TypeAlias, cast
+from typing import Any, Mapping, TypeAlias, cast
 
+from dayu.contracts.execution_options import (
+    ConversationMemoryConfig,
+    ConversationMemorySettings,
+    ExecutionOptions,
+    TraceSettings,
+)
 from dayu.contracts.model_config import ConversationMemoryRuntimeHints, ModelConfig
+from dayu.contracts.tool_configs import (
+    DocToolLimits,
+    FinsToolLimits,
+    WebToolsConfig,
+    build_doc_tool_limits,
+    build_fins_tool_limits,
+    build_legacy_toolset_configs,
+    build_web_tools_config,
+)
 from dayu.contracts.toolset_config import (
     ToolsetConfigSnapshot,
     ToolsetConfigValue,
@@ -17,10 +32,7 @@ from dayu.contracts.toolset_config import (
     replace_toolset_config,
     serialize_toolset_config_payload_value,
 )
-from dayu.execution.doc_limits import DocToolLimits
 from dayu.execution.runtime_config import AgentRuntimeConfig, OpenAIRunnerRuntimeConfig, RunnerRuntimeConfig
-from dayu.execution.web_limits import WebToolsConfig
-from dayu.fins.tools.fins_limits import FinsToolLimits
 
 @dataclass(frozen=True)
 class _ToolTraceConfigDefaults:
@@ -90,47 +102,6 @@ def _resolve_optional_workspace_path(path_value: Any, *, workspace_dir: Path) ->
     return str((workspace_dir / candidate).resolve())
 
 
-@dataclass(frozen=True)
-class TraceSettings:
-    """工具调用追踪配置。"""
-
-    enabled: bool
-    output_dir: Path
-    max_file_bytes: int = 64 * 1024 * 1024
-    retention_days: int = 30
-    compress_rolled: bool = True
-    partition_by_session: bool = True
-
-
-@dataclass(frozen=True)
-class ConversationMemorySettings:
-    """多轮会话分层记忆配置。"""
-
-    working_memory_max_turns: int = 6
-    working_memory_token_budget_ratio: float = 0.08
-    working_memory_token_budget_floor: int = 1500
-    working_memory_token_budget_cap: int = 6000
-    episodic_memory_token_budget_ratio: float = 0.02
-    episodic_memory_token_budget_floor: int = 2000
-    episodic_memory_token_budget_cap: int = 12000
-    compaction_trigger_turn_count: int = 8
-    compaction_trigger_token_ratio: float = 1.5
-    compaction_tail_preserve_turns: int = 4
-    compaction_context_episode_window: int = 2
-    compaction_scene_name: str = "conversation_compaction"
-
-
-@dataclass(frozen=True)
-class ConversationMemoryConfig:
-    """多轮会话记忆配置集合。
-
-    该配置只描述 memory policy，不重复声明模型的客观能力。
-    真正的上下文窗口大小仍然以 ``llm_models.json`` 为真源。
-    """
-
-    default: ConversationMemorySettings = field(default_factory=ConversationMemorySettings)
-
-
 _DEFAULT_RUN_CONFIG = _DefaultRunConfig(
     runner_running_config=OpenAIRunnerRuntimeConfig(
         debug_sse=False,
@@ -139,33 +110,7 @@ _DEFAULT_RUN_CONFIG = _DefaultRunConfig(
         debug_sse_throttle_sec=0.0,
         tool_timeout_seconds=90.0,
     ),
-    agent_running_config=AgentRuntimeConfig(
-        max_iterations=16,
-        fallback_prompt=(
-            "Based on the information gathered, answer the question directly. "
-            "Do not fabricate if information is insufficient."
-        ),
-        duplicate_tool_hint_prompt=(
-            "You just called the same tool ({{tool_name}}) with identical parameters. "
-            "Reuse the existing results first. Only call a tool again if you clearly "
-            "need new information, and provide your conclusion promptly."
-        ),
-        continuation_prompt=(
-            "Your previous response was truncated (finish_reason=length). "
-            "Continue from where you left off without repeating content already produced."
-        ),
-        compaction_summary_header="[Context Compaction Summary]",
-        compaction_summary_instruction=(
-            "Continue reasoning based on recent context. "
-            "Avoid repeating tool calls that have already been completed."
-        ),
-        max_consecutive_failed_tool_batches=2,
-        max_duplicate_tool_calls=2,
-        budget_soft_limit_ratio=0.75,
-        budget_hard_limit_ratio=0.90,
-        max_continuations=3,
-        max_compactions=3,
-    ),
+    agent_running_config=AgentRuntimeConfig(),
     doc_tool_limits=DocToolLimits(
         list_files_max=200,
         get_sections_max=200,
@@ -379,51 +324,6 @@ def resolve_scene_temperature(
             f"scene={scene_name}, model={model_name} 缺少 temperature"
         )
     return normalized
-
-
-@dataclass(frozen=True)
-class ExecutionOptions:
-    """请求级执行覆盖参数。"""
-
-    model_name: Optional[str] = None
-    temperature: Optional[float] = None
-    debug_sse: bool = False
-    debug_tool_delta: bool = False
-    debug_sse_sample_rate: Optional[float] = None
-    debug_sse_throttle_sec: Optional[float] = None
-    tool_timeout_seconds: Optional[float] = None
-    max_iterations: Optional[int] = None
-    fallback_mode: Optional[str] = None
-    fallback_prompt: Optional[str] = None
-    max_consecutive_failed_tool_batches: Optional[int] = None
-    max_duplicate_tool_calls: Optional[int] = None
-    duplicate_tool_hint_prompt: Optional[str] = None
-    web_provider: Optional[str] = None
-    trace_enabled: Optional[bool] = None
-    trace_output_dir: Optional[Path] = None
-    toolset_configs: tuple[ToolsetConfigSnapshot, ...] = field(default_factory=tuple)
-    toolset_config_overrides: tuple[ToolsetConfigSnapshot, ...] = field(default_factory=tuple)
-    doc_tool_limits: Optional[DocToolLimits] = None
-    fins_tool_limits: Optional[FinsToolLimits] = None
-    web_tools_config: Optional[WebToolsConfig] = None
-
-    def __post_init__(self) -> None:
-        """规范化请求级 toolset 配置快照。"""
-
-        normalized_configs = _build_legacy_toolset_configs(
-            doc_tool_limits=self.doc_tool_limits,
-            fins_tool_limits=self.fins_tool_limits,
-            web_tools_config=self.web_tools_config,
-        )
-        for snapshot in normalize_toolset_configs(self.toolset_configs):
-            normalized_configs = replace_toolset_config(normalized_configs, snapshot)
-        object.__setattr__(self, "toolset_configs", normalized_configs)
-
-        object.__setattr__(
-            self,
-            "toolset_config_overrides",
-            normalize_toolset_configs(self.toolset_config_overrides),
-        )
 
 
 def _build_doc_tool_limits_from_override(
@@ -772,175 +672,6 @@ def _snapshot_str_or_default(
     return parsed
 
 
-def _build_doc_tool_limits_from_snapshot(
-    payload: Mapping[str, ExecutionOptionsSnapshotValue] | None,
-) -> DocToolLimits | None:
-    """从快照对象恢复文档工具限制配置。
-
-    Args:
-        payload: 文档工具限制快照对象。
-
-    Returns:
-        恢复后的文档工具限制；输入为空时返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    if payload is None:
-        return None
-    defaults = DocToolLimits()
-    return DocToolLimits(
-        list_files_max=_snapshot_int_or_default(payload.get("list_files_max"), default=defaults.list_files_max),
-        get_sections_max=_snapshot_int_or_default(payload.get("get_sections_max"), default=defaults.get_sections_max),
-        search_files_max_results=_snapshot_int_or_default(
-            payload.get("search_files_max_results"),
-            default=defaults.search_files_max_results,
-        ),
-        read_file_max_chars=_snapshot_int_or_default(
-            payload.get("read_file_max_chars"),
-            default=defaults.read_file_max_chars,
-        ),
-        read_file_section_max_chars=_snapshot_int_or_default(
-            payload.get("read_file_section_max_chars"),
-            default=defaults.read_file_section_max_chars,
-        ),
-    )
-
-
-def _build_fins_tool_limits_from_snapshot(
-    payload: Mapping[str, ExecutionOptionsSnapshotValue] | None,
-) -> FinsToolLimits | None:
-    """从快照对象恢复财报工具限制配置。
-
-    Args:
-        payload: 财报工具限制快照对象。
-
-    Returns:
-        恢复后的财报工具限制；输入为空时返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    if payload is None:
-        return None
-    defaults = FinsToolLimits()
-    return FinsToolLimits(
-        processor_cache_max_entries=_snapshot_int_or_default(
-            payload.get("processor_cache_max_entries"),
-            default=defaults.processor_cache_max_entries,
-        ),
-        list_documents_max_items=_snapshot_int_or_default(
-            payload.get("list_documents_max_items"),
-            default=defaults.list_documents_max_items,
-        ),
-        get_document_sections_max_items=_snapshot_int_or_default(
-            payload.get("get_document_sections_max_items"),
-            default=defaults.get_document_sections_max_items,
-        ),
-        search_document_max_items=_snapshot_int_or_default(
-            payload.get("search_document_max_items"),
-            default=defaults.search_document_max_items,
-        ),
-        list_tables_max_items=_snapshot_int_or_default(
-            payload.get("list_tables_max_items"),
-            default=defaults.list_tables_max_items,
-        ),
-        read_section_max_chars=_snapshot_int_or_default(
-            payload.get("read_section_max_chars"),
-            default=defaults.read_section_max_chars,
-        ),
-        get_page_content_max_chars=_snapshot_int_or_default(
-            payload.get("get_page_content_max_chars"),
-            default=defaults.get_page_content_max_chars,
-        ),
-        get_table_max_items=_snapshot_int_or_default(
-            payload.get("get_table_max_items"),
-            default=defaults.get_table_max_items,
-        ),
-        get_financial_statement_max_items=_snapshot_int_or_default(
-            payload.get("get_financial_statement_max_items"),
-            default=defaults.get_financial_statement_max_items,
-        ),
-        query_xbrl_facts_max_items=_snapshot_int_or_default(
-            payload.get("query_xbrl_facts_max_items"),
-            default=defaults.query_xbrl_facts_max_items,
-        ),
-    )
-
-
-def _build_web_tools_config_from_snapshot(
-    payload: Mapping[str, ExecutionOptionsSnapshotValue] | None,
-) -> WebToolsConfig | None:
-    """从快照对象恢复联网工具配置。
-
-    Args:
-        payload: 联网工具配置快照对象。
-
-    Returns:
-        恢复后的联网工具配置；输入为空时返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    if payload is None:
-        return None
-    defaults = WebToolsConfig()
-    playwright_channel = payload.get("playwright_channel")
-    playwright_storage_state_dir = payload.get("playwright_storage_state_dir")
-    return WebToolsConfig(
-        provider=_snapshot_str_or_default(payload.get("provider"), default=defaults.provider),
-        request_timeout_seconds=_snapshot_float_or_default(
-            payload.get("request_timeout_seconds"),
-            default=defaults.request_timeout_seconds,
-        ),
-        max_search_results=_snapshot_int_or_default(
-            payload.get("max_search_results"),
-            default=defaults.max_search_results,
-        ),
-        fetch_truncate_chars=_snapshot_int_or_default(
-            payload.get("fetch_truncate_chars"),
-            default=defaults.fetch_truncate_chars,
-        ),
-        allow_private_network_url=_snapshot_bool_or_default(
-            payload.get("allow_private_network_url"),
-            default=defaults.allow_private_network_url,
-        ),
-        playwright_channel=(
-            str(playwright_channel)
-            if isinstance(playwright_channel, str)
-            else defaults.playwright_channel
-        ),
-        playwright_storage_state_dir=(
-            str(playwright_storage_state_dir)
-            if isinstance(playwright_storage_state_dir, str)
-            else defaults.playwright_storage_state_dir
-        ),
-    )
-
-
-def _build_legacy_toolset_configs(
-    *,
-    doc_tool_limits: DocToolLimits | None,
-    fins_tool_limits: FinsToolLimits | None,
-    web_tools_config: WebToolsConfig | None,
-) -> tuple[ToolsetConfigSnapshot, ...]:
-    """把旧式专用工具配置收敛为通用 toolset 快照。"""
-
-    snapshots: tuple[ToolsetConfigSnapshot, ...] = ()
-    for snapshot in (
-        build_toolset_config_snapshot("doc", doc_tool_limits),
-        build_toolset_config_snapshot("fins", fins_tool_limits),
-        build_toolset_config_snapshot("web", web_tools_config),
-    ):
-        if snapshot is None:
-            continue
-        snapshots = replace_toolset_config(snapshots, snapshot)
-    return snapshots
-
-
 def _resolve_toolset_override_payload(
     snapshots: tuple[ToolsetConfigSnapshot, ...],
     *,
@@ -976,7 +707,9 @@ def _resolve_doc_tool_limits_from_toolset_configs(
     """从通用 toolset 快照恢复文档工具限制。"""
 
     snapshot = find_toolset_config(toolset_configs, "doc")
-    return _build_doc_tool_limits_from_snapshot(snapshot.payload if snapshot is not None else None)
+    if snapshot is None:
+        return None
+    return build_doc_tool_limits(snapshot)
 
 
 def resolve_doc_tool_limits_from_toolset_configs(
@@ -1003,7 +736,9 @@ def _resolve_fins_tool_limits_from_toolset_configs(
     """从通用 toolset 快照恢复财报工具限制。"""
 
     snapshot = find_toolset_config(toolset_configs, "fins")
-    return _build_fins_tool_limits_from_snapshot(snapshot.payload if snapshot is not None else None)
+    if snapshot is None:
+        return None
+    return build_fins_tool_limits(snapshot)
 
 
 def resolve_fins_tool_limits_from_toolset_configs(
@@ -1030,7 +765,9 @@ def _resolve_web_tools_config_from_toolset_configs(
     """从通用 toolset 快照恢复联网工具配置。"""
 
     snapshot = find_toolset_config(toolset_configs, "web")
-    return _build_web_tools_config_from_snapshot(snapshot.payload if snapshot is not None else None)
+    if snapshot is None:
+        return None
+    return build_web_tools_config(snapshot)
 
 
 def resolve_web_tools_config_from_toolset_configs(
@@ -1247,15 +984,15 @@ def deserialize_execution_options_snapshot(
     )
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class ResolvedExecutionOptions:
     """合并后的执行选项。"""
 
     model_name: str
     runner_running_config: RunnerRuntimeConfig
     agent_running_config: AgentRuntimeConfig
-    toolset_configs: tuple[ToolsetConfigSnapshot, ...]
     trace_settings: TraceSettings
+    toolset_configs: tuple[ToolsetConfigSnapshot, ...] = ()
     temperature: float | None = None
     conversation_memory_config: ConversationMemoryConfig = field(
         default_factory=ConversationMemoryConfig
@@ -1264,29 +1001,11 @@ class ResolvedExecutionOptions:
         default_factory=ConversationMemorySettings
     )
 
-    def __init__(
-        self,
-        *,
-        model_name: str,
-        runner_running_config: RunnerRuntimeConfig,
-        agent_running_config: AgentRuntimeConfig,
-        trace_settings: TraceSettings,
-        temperature: float | None = None,
-        conversation_memory_config: ConversationMemoryConfig | None = None,
-        conversation_memory_settings: ConversationMemorySettings | None = None,
-        toolset_configs: tuple[ToolsetConfigSnapshot, ...] = (),
-    ) -> None:
-        """初始化合并后的执行选项。
+    def __post_init__(self) -> None:
+        """执行冻结 dataclass 的派生字段规范化。
 
         Args:
-            model_name: 已解析的模型名。
-            runner_running_config: Runner 运行配置。
-            agent_running_config: Agent 运行配置。
-            trace_settings: Trace 配置。
-            temperature: 已解析 temperature。
-            conversation_memory_config: 会话记忆配置集合。
-            conversation_memory_settings: 已解析的会话记忆配置。
-            toolset_configs: 通用 toolset 配置快照。
+            无。
 
         Returns:
             无。
@@ -1296,22 +1015,7 @@ class ResolvedExecutionOptions:
             ValueError: 当 toolset 名称非法时抛出。
         """
 
-        object.__setattr__(self, "model_name", model_name)
-        object.__setattr__(self, "runner_running_config", runner_running_config)
-        object.__setattr__(self, "agent_running_config", agent_running_config)
-        object.__setattr__(self, "toolset_configs", normalize_toolset_configs(toolset_configs))
-        object.__setattr__(self, "trace_settings", trace_settings)
-        object.__setattr__(self, "temperature", temperature)
-        object.__setattr__(
-            self,
-            "conversation_memory_config",
-            conversation_memory_config or ConversationMemoryConfig(),
-        )
-        object.__setattr__(
-            self,
-            "conversation_memory_settings",
-            conversation_memory_settings or ConversationMemorySettings(),
-        )
+        object.__setattr__(self, "toolset_configs", normalize_toolset_configs(self.toolset_configs))
 
 
 def _merge_section(base: dict[str, Any], incoming: Any) -> dict[str, Any]:
@@ -1491,7 +1195,7 @@ def build_base_execution_options(
         temperature=None,
         runner_running_config=OpenAIRunnerRuntimeConfig(**merged_runner),
         agent_running_config=AgentRuntimeConfig(**merged_agent),
-        toolset_configs=_build_legacy_toolset_configs(
+        toolset_configs=build_legacy_toolset_configs(
             doc_tool_limits=DocToolLimits(**merged_doc_limits),
             fins_tool_limits=FinsToolLimits(**merged_fins_limits),
             web_tools_config=WebToolsConfig(**merged_web),
@@ -1637,7 +1341,7 @@ def merge_execution_options(
     merged_toolset_configs = _merge_toolset_configs(base_options.toolset_configs, execution_options.toolset_configs)
     merged_toolset_configs = _merge_toolset_configs(
         merged_toolset_configs,
-        _build_legacy_toolset_configs(
+        build_legacy_toolset_configs(
             doc_tool_limits=doc_tool_limits or base_doc_tool_limits,
             fins_tool_limits=fins_tool_limits or base_fins_tool_limits,
             web_tools_config=web_tools_config,

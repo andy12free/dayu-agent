@@ -1446,7 +1446,7 @@ def _recover_index_as_column(df: pd.DataFrame) -> pd.DataFrame:
     result.insert(
         0,
         _resolve_recovered_index_column_name(df.index),
-        recovered_values,
+        pd.Index(recovered_values, dtype="object"),
         allow_duplicates=True,
     )
     return result
@@ -1663,7 +1663,7 @@ def _collapse_ghost_columns(df: pd.DataFrame) -> pd.DataFrame:
         result_cols.append(clean_name)
         result_data[clean_name] = merged_values
 
-    return pd.DataFrame(result_data, columns=result_cols)
+    return pd.DataFrame(result_data, columns=pd.Index(result_cols, dtype="object"))
 
 
 def _ghost_column_base_name(col_name: Any) -> str:
@@ -2184,11 +2184,19 @@ def _render_markdown_table(table_obj: Any, fallback_text: str) -> str:
     table_df = _safe_table_dataframe(table_obj)
     if table_df is not None and not table_df.empty:
         try:
+            from tabulate import tabulate as _tabulate
+
+            del _tabulate
             # NaN 在 MultiIndex 合并单元格中常见，转 markdown 前统一填为空字符串
             cleaned_df = table_df.fillna("")
-            return cleaned_df.to_markdown(index=False)
-        except Exception:
-            pass
+            markdown = cleaned_df.to_markdown(index=False)
+            if isinstance(markdown, str) and markdown.strip():
+                return markdown
+            raise RuntimeError("SEC 表格 markdown 渲染结果为空")
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("缺少 tabulate 依赖，无法渲染 SEC 表格 markdown") from exc
+        except Exception as exc:
+            raise RuntimeError(f"SEC 表格 markdown 渲染失败: {exc}") from exc
     if fallback_text:
         return fallback_text
     return _normalize_whitespace(str(getattr(table_obj, "to_dict", lambda: {})()))

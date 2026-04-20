@@ -3,25 +3,59 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from dayu.cli.init_command import (
+from dayu.cli.commands.init import (
     _HF_MIRROR_URL,
     _INIT_ROLE_KEY,
+    _PROVIDER_OPTION_DEEPSEEK,
+    _PROVIDER_OPTION_MIMO_FLASH,
+    _PROVIDER_OPTION_MIMO_PRO,
     _ROLE_NON_THINKING,
     _ROLE_THINKING,
     _classify_model_role,
+    _copy_assets,
     _copy_config,
     _detect_shell_profile,
     _is_hf_hub_reachable,
+    _persist_env_var,
+    _prompt_api_key,
     _prompt_huggingface_config,
+    _prompt_optional_search_keys,
+    _prompt_provider_selection,
+    _prompt_sec_user_agent,
+    _resolve_role_from_package_manifest,
+    _run_init_prewarm,
+    _should_run_init_prewarm,
     _update_manifest_default_models,
     _write_env_to_shell_profile,
-    run_init,
+    _write_env_windows,
+    SEC_USER_AGENT_ENV,
+    run_init_command,
 )
+
+_PROVIDER_ENV_KEYS: tuple[str, ...] = (
+    "MIMO_PLAN_API_KEY",
+    "MIMO_PLAN_SG_API_KEY",
+    "MIMO_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "QWEN_API_KEY",
+)
+
+
+def _clear_provider_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
+    """清理 `dayu-cli init` 主模型供应商相关环境变量。"""
+
+    for key in _PROVIDER_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -56,12 +90,37 @@ class TestDetectShellProfile:
         assert profile == tmp_path / ".bash_profile"
         assert compatible is True
 
-    def test_unknown_shell_returns_incompatible(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """未知 shell（如 fish）返回 ~/.profile，兼容标记为 False。"""
+    def test_fish_shell_returns_incompatible(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """明确识别为 fish 时返回 ~/.profile，兼容标记为 False。"""
         monkeypatch.setenv("SHELL", "/bin/fish")
         profile, compatible = _detect_shell_profile()
         assert profile == Path.home() / ".profile"
         assert compatible is False
+
+    def test_missing_shell_falls_back_to_existing_bashrc(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """SHELL 缺失时，回退到 HOME 下现有 .bashrc。"""
+        monkeypatch.delenv("SHELL", raising=False)
+        (tmp_path / ".bashrc").touch()
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        profile, compatible = _detect_shell_profile()
+        assert profile == tmp_path / ".bashrc"
+        assert compatible is True
+
+    def test_missing_shell_without_known_profile_uses_profile(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """SHELL 缺失且无现有 profile 时，回退到 ~/.profile 并视为兼容。"""
+        monkeypatch.delenv("SHELL", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        profile, compatible = _detect_shell_profile()
+        assert profile == tmp_path / ".profile"
+        assert compatible is True
 
 
 # --------------------------------------------------------------------------- #
@@ -126,7 +185,7 @@ class TestCopyConfig:
         src.mkdir()
         (src / "run.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(
-            "dayu.cli.init_command._resolve_package_config_path",
+            "dayu.cli.commands.init.resolve_package_config_path",
             lambda: src,
         )
 
@@ -143,7 +202,7 @@ class TestCopyConfig:
         src.mkdir()
         (src / "new.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(
-            "dayu.cli.init_command._resolve_package_config_path",
+            "dayu.cli.commands.init.resolve_package_config_path",
             lambda: src,
         )
 
@@ -163,7 +222,7 @@ class TestCopyConfig:
         src.mkdir()
         (src / "new.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(
-            "dayu.cli.init_command._resolve_package_config_path",
+            "dayu.cli.commands.init.resolve_package_config_path",
             lambda: src,
         )
 
@@ -176,6 +235,70 @@ class TestCopyConfig:
 
         assert (result / "new.json").exists()
         assert not (result / "old.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+#  _copy_assets
+# --------------------------------------------------------------------------- #
+
+
+class TestCopyAssets:
+    """assets 复制测试。"""
+
+    def test_copy_creates_assets_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """复制应创建 assets 目录。"""
+        src = tmp_path / "pkg_assets"
+        src.mkdir()
+        (src / "定性分析模板.md").write_text("# 模板", encoding="utf-8")
+        monkeypatch.setattr(
+            "dayu.cli.commands.init.resolve_package_assets_path",
+            lambda: src,
+        )
+
+        base = tmp_path / "workspace"
+        base.mkdir()
+        result = _copy_assets(base, overwrite=False)
+
+        assert result.exists()
+        assert (result / "定性分析模板.md").exists()
+
+    def test_skip_existing_without_overwrite(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """已存在时不覆盖。"""
+        src = tmp_path / "pkg_assets"
+        src.mkdir()
+        (src / "定性分析模板.md").write_text("# 新模板", encoding="utf-8")
+        monkeypatch.setattr(
+            "dayu.cli.commands.init.resolve_package_assets_path",
+            lambda: src,
+        )
+
+        base = tmp_path / "workspace"
+        assets_dir = base / "assets"
+        assets_dir.mkdir(parents=True)
+        (assets_dir / "定性分析模板.md").write_text("# 旧模板", encoding="utf-8")
+
+        result = _copy_assets(base, overwrite=False)
+
+        assert (result / "定性分析模板.md").read_text(encoding="utf-8") == "# 旧模板"
+
+    def test_overwrite_replaces(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--overwrite 时替换。"""
+        src = tmp_path / "pkg_assets"
+        src.mkdir()
+        (src / "定性分析模板.md").write_text("# 新模板", encoding="utf-8")
+        monkeypatch.setattr(
+            "dayu.cli.commands.init.resolve_package_assets_path",
+            lambda: src,
+        )
+
+        base = tmp_path / "workspace"
+        assets_dir = base / "assets"
+        assets_dir.mkdir(parents=True)
+        (assets_dir / "定性分析模板.md").write_text("# 旧模板", encoding="utf-8")
+
+        result = _copy_assets(base, overwrite=True)
+
+        assert (result / "定性分析模板.md").read_text(encoding="utf-8") == "# 新模板"
 
 
 # --------------------------------------------------------------------------- #
@@ -225,12 +348,12 @@ class TestUpdateManifestDefaultModels:
 
 
 # --------------------------------------------------------------------------- #
-#  run_init 集成测试
+#  run_init_command 集成测试
 # --------------------------------------------------------------------------- #
 
 
 class TestRunInit:
-    """run_init 集成测试（mock 交互输入）。"""
+    """run_init_command 集成测试（mock 交互输入）。"""
 
     def test_full_flow(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """完整流程：复制配置 → 选供应商 → 输入 Key → 更新 manifest。"""
@@ -246,35 +369,51 @@ class TestRunInit:
         )
 
         monkeypatch.setattr(
-            "dayu.cli.init_command._resolve_package_config_path",
+            "dayu.cli.commands.init.resolve_package_config_path",
             lambda: src,
         )
 
+        # 准备 mock 包内 assets
+        pkg_assets = tmp_path / "pkg_assets"
+        pkg_assets.mkdir()
+        (pkg_assets / "定性分析模板.md").write_text("# 模板", encoding="utf-8")
+        monkeypatch.setattr(
+            "dayu.cli.commands.init.resolve_package_assets_path",
+            lambda: pkg_assets,
+        )
+
         # 确保环境变量中没有任何模型 key 和搜索 key
-        for k in ("DEEPSEEK_API_KEY", "TAVILY_API_KEY", "SERPER_API_KEY", "FMP_API_KEY"):
+        _clear_provider_env_vars(monkeypatch)
+        for k in ("TAVILY_API_KEY", "SERPER_API_KEY", "FMP_API_KEY"):
             monkeypatch.delenv(k, raising=False)
+        monkeypatch.delenv(SEC_USER_AGENT_ENV, raising=False)
 
         # 清除 HF 环境变量
         monkeypatch.delenv("HF_ENDPOINT", raising=False)
         monkeypatch.delenv("HF_TOKEN", raising=False)
         # Mock HF Hub 不可达 → 默认 Y
-        monkeypatch.setattr("dayu.cli.init_command._is_hf_hub_reachable", lambda: False)
+        monkeypatch.setattr("dayu.cli.commands.init._is_hf_hub_reachable", lambda: False)
 
-        # Mock 交互输入: 选择 3 (DeepSeek)，输入 key，跳过可选 key x3，HF 镜像回车(默认Y)，HF_TOKEN 跳过
-        inputs = iter(["3", "sk-test-key-123", "", "", "", "", ""])
+        # Mock 交互输入: 输入 key，跳过可选 key x3，HF 镜像回车(默认Y)，HF_TOKEN 跳过
+        inputs = iter(["sk-test-key-123", "", "", "", "", "", ""])
         monkeypatch.setattr("builtins.input", lambda *_args: next(inputs))
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_provider_selection", lambda: _PROVIDER_OPTION_DEEPSEEK)
 
         # Mock 环境变量持久化
         monkeypatch.setattr(
-            "dayu.cli.init_command._persist_env_var",
+            "dayu.cli.commands.init._persist_env_var",
             lambda _k, _v: ("~/.zshrc", True),
+        )
+        monkeypatch.setattr(
+            "dayu.cli.commands.init._run_init_prewarm",
+            lambda **_kwargs: (True, ""),
         )
 
         base = tmp_path / "workspace"
         base.mkdir()
         args = Namespace(base=str(base), overwrite=False)
 
-        exit_code = run_init(args)
+        exit_code = run_init_command(args)
         assert exit_code == 0
 
         # 验证 manifest 被更新
@@ -296,23 +435,30 @@ class TestRunInit:
         )
 
         monkeypatch.setattr(
-            "dayu.cli.init_command._resolve_package_config_path",
+            "dayu.cli.commands.init.resolve_package_config_path",
             lambda: src,
         )
 
+        # 准备 mock 包内 assets
+        pkg_assets = tmp_path / "pkg_assets"
+        pkg_assets.mkdir()
+        (pkg_assets / "定性分析模板.md").write_text("# 模板", encoding="utf-8")
+        monkeypatch.setattr(
+            "dayu.cli.commands.init.resolve_package_assets_path",
+            lambda: pkg_assets,
+        )
+
+        _clear_provider_env_vars(monkeypatch)
         # 预设 DEEPSEEK_API_KEY 和所有搜索 key
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-already-set-123456")
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-xxx")
         monkeypatch.setenv("SERPER_API_KEY", "sp-xxx")
         monkeypatch.setenv("FMP_API_KEY", "fmp-xxx")
+        monkeypatch.setenv(SEC_USER_AGENT_ENV, "Demo demo@example.com")
 
         # 预设 HF 环境变量
         monkeypatch.setenv("HF_ENDPOINT", "https://hf-mirror.com")
         monkeypatch.setenv("HF_TOKEN", "hf-test-xxx")
-
-        # 只需要选供应商（选 3 = DeepSeek），不需要输入 key
-        inputs = iter(["3"])
-        monkeypatch.setattr("builtins.input", lambda *_args: next(inputs))
 
         # _persist_env_var 不应被调用
         persist_calls: list[str] = []
@@ -321,13 +467,18 @@ class TestRunInit:
             persist_calls.append(k)
             return "~/.zshrc", True
 
-        monkeypatch.setattr("dayu.cli.init_command._persist_env_var", _mock_persist)
+        monkeypatch.setattr("dayu.cli.commands.init._persist_env_var", _mock_persist)
+        monkeypatch.setattr(
+            "dayu.cli.commands.init._run_init_prewarm",
+            lambda **_kwargs: (True, ""),
+        )
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_provider_selection", lambda: _PROVIDER_OPTION_DEEPSEEK)
 
         base = tmp_path / "workspace"
         base.mkdir()
         args = Namespace(base=str(base), overwrite=False)
 
-        exit_code = run_init(args)
+        exit_code = run_init_command(args)
         assert exit_code == 0
         # 没有调用 _persist_env_var（key 已存在，搜索 key 也已存在）
         assert persist_calls == []
@@ -410,7 +561,7 @@ class TestUpdateManifestSecondInit:
             encoding="utf-8",
         )
         monkeypatch.setattr(
-            "dayu.cli.init_command._resolve_package_config_path",
+            "dayu.cli.commands.init.resolve_package_config_path",
             lambda: tmp_path / "pkg_config",
         )
 
@@ -435,7 +586,7 @@ class TestUpdateManifestSecondInit:
         pkg_config = tmp_path / "pkg_config"
         pkg_config.mkdir()
         monkeypatch.setattr(
-            "dayu.cli.init_command._resolve_package_config_path",
+            "dayu.cli.commands.init.resolve_package_config_path",
             lambda: pkg_config,
         )
 
@@ -459,7 +610,7 @@ class TestUpdateManifestSecondInit:
         pkg_config = tmp_path / "pkg_config"
         pkg_config.mkdir()
         monkeypatch.setattr(
-            "dayu.cli.init_command._resolve_package_config_path",
+            "dayu.cli.commands.init.resolve_package_config_path",
             lambda: pkg_config,
         )
 
@@ -515,7 +666,7 @@ class TestPromptHuggingfaceConfig:
         """Hub 不可达，用户按回车接受默认 Y 并输入 token 时返回两项。"""
         monkeypatch.delenv("HF_ENDPOINT", raising=False)
         monkeypatch.delenv("HF_TOKEN", raising=False)
-        monkeypatch.setattr("dayu.cli.init_command._is_hf_hub_reachable", lambda: False)
+        monkeypatch.setattr("dayu.cli.commands.init._is_hf_hub_reachable", lambda: False)
 
         inputs = iter(["", "hf_test_token_123"])
         monkeypatch.setattr("builtins.input", lambda *_args: next(inputs))
@@ -528,7 +679,7 @@ class TestPromptHuggingfaceConfig:
         """用户选 n 并跳过 token 时返回空列表。"""
         monkeypatch.delenv("HF_ENDPOINT", raising=False)
         monkeypatch.delenv("HF_TOKEN", raising=False)
-        monkeypatch.setattr("dayu.cli.init_command._is_hf_hub_reachable", lambda: False)
+        monkeypatch.setattr("dayu.cli.commands.init._is_hf_hub_reachable", lambda: False)
 
         inputs = iter(["n", ""])
         monkeypatch.setattr("builtins.input", lambda *_args: next(inputs))
@@ -540,7 +691,7 @@ class TestPromptHuggingfaceConfig:
         """Hub 可达时，回车默认不启用镜像。"""
         monkeypatch.delenv("HF_ENDPOINT", raising=False)
         monkeypatch.delenv("HF_TOKEN", raising=False)
-        monkeypatch.setattr("dayu.cli.init_command._is_hf_hub_reachable", lambda: True)
+        monkeypatch.setattr("dayu.cli.commands.init._is_hf_hub_reachable", lambda: True)
 
         inputs = iter(["", ""])
         monkeypatch.setattr("builtins.input", lambda *_args: next(inputs))
@@ -552,10 +703,725 @@ class TestPromptHuggingfaceConfig:
         """Hub 可达但用户显式输入 y 时仍启用镜像。"""
         monkeypatch.delenv("HF_ENDPOINT", raising=False)
         monkeypatch.delenv("HF_TOKEN", raising=False)
-        monkeypatch.setattr("dayu.cli.init_command._is_hf_hub_reachable", lambda: True)
+        monkeypatch.setattr("dayu.cli.commands.init._is_hf_hub_reachable", lambda: True)
 
         inputs = iter(["y", ""])
         monkeypatch.setattr("builtins.input", lambda *_args: next(inputs))
 
         result = _prompt_huggingface_config()
         assert ("HF_ENDPOINT", _HF_MIRROR_URL) in result
+
+
+# --------------------------------------------------------------------------- #
+#  _write_env_to_shell_profile — content 不以换行结尾
+# --------------------------------------------------------------------------- #
+
+
+class TestWriteEnvNoTrailingNewline:
+    """content 不以换行结尾时先写换行再追加。"""
+
+    def test_append_when_content_lacks_trailing_newline(self, tmp_path: Path) -> None:
+        """文件内容不以换行结尾时，追加前应先写入换行。"""
+        profile = tmp_path / ".zshrc"
+        profile.write_text("# existing", encoding="utf-8")
+
+        result = _write_env_to_shell_profile("MY_KEY", "val", profile)
+        assert result is True
+
+        content = profile.read_text(encoding="utf-8")
+        assert 'export MY_KEY="val"' in content
+
+
+# --------------------------------------------------------------------------- #
+#  _write_env_windows
+# --------------------------------------------------------------------------- #
+
+
+class TestWriteEnvWindows:
+    """Windows setx 环境变量写入测试。"""
+
+    def test_setx_success(self) -> None:
+        """setx 返回码为 0 时返回 True。"""
+        with patch("dayu.cli.commands.init.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            assert _write_env_windows("MY_KEY", "my_value") is True
+
+    def test_setx_failure(self) -> None:
+        """setx 返回码非 0 时返回 False。"""
+        with patch("dayu.cli.commands.init.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+            assert _write_env_windows("MY_KEY", "my_value") is False
+
+
+# --------------------------------------------------------------------------- #
+#  _persist_env_var — Windows 与非兼容 shell 分支
+# --------------------------------------------------------------------------- #
+
+
+class TestPersistEnvVar:
+    """跨平台环境变量持久化测试。"""
+
+    def test_windows_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Windows 平台 setx 成功时返回正确描述。"""
+        monkeypatch.setattr("dayu.cli.commands.init.platform.system", lambda: "Windows")
+        with patch("dayu.cli.commands.init._write_env_windows", return_value=True):
+            target, ok = _persist_env_var("MY_KEY", "val")
+        assert ok is True
+        assert "setx" in target
+
+    def test_windows_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Windows 平台 setx 失败时返回 False。"""
+        monkeypatch.setattr("dayu.cli.commands.init.platform.system", lambda: "Windows")
+        with patch("dayu.cli.commands.init._write_env_windows", return_value=False):
+            target, ok = _persist_env_var("MY_KEY", "val")
+        assert ok is False
+        assert target == "setx"
+
+    def test_non_compatible_shell(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """明确识别为不兼容 shell 时返回 False。"""
+        monkeypatch.setattr("dayu.cli.commands.init.platform.system", lambda: "Linux")
+        monkeypatch.setattr(
+            "dayu.cli.commands.init._detect_shell_profile",
+            lambda: (Path.home() / ".profile", False),
+        )
+        target, ok = _persist_env_var("MY_KEY", "val")
+        assert ok is False
+
+    def test_write_profile_failure_returns_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """profile 文件写入失败时返回 False，而不是依赖 SHELL 误判。"""
+        monkeypatch.setattr("dayu.cli.commands.init.platform.system", lambda: "Linux")
+        monkeypatch.setattr(
+            "dayu.cli.commands.init._detect_shell_profile",
+            lambda: (Path.home() / ".profile", True),
+        )
+
+        def _raise_os_error(_key: str, _value: str, _profile: Path) -> bool:
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr("dayu.cli.commands.init._write_env_to_shell_profile", _raise_os_error)
+        target, ok = _persist_env_var("MY_KEY", "val")
+        assert target.endswith(".profile")
+        assert ok is False
+
+    def test_sets_process_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """始终设置当前进程环境变量。"""
+        monkeypatch.setattr("dayu.cli.commands.init.platform.system", lambda: "Windows")
+        with patch("dayu.cli.commands.init._write_env_windows", return_value=True):
+            _persist_env_var("TEST_PERSIST_KEY", "test_val")
+        assert __import__("os").environ.get("TEST_PERSIST_KEY") == "test_val"
+
+
+# --------------------------------------------------------------------------- #
+#  _resolve_role_from_package_manifest — 错误分支
+# --------------------------------------------------------------------------- #
+
+
+class TestResolveRoleFromPackageManifest:
+    """包内 manifest 角色推断测试。"""
+
+    def test_manifest_not_exists(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """包内 manifest 不存在时返回 None。"""
+        pkg_config = tmp_path / "pkg_config"
+        pkg_config.mkdir()
+        monkeypatch.setattr(
+            "dayu.cli.commands.init.resolve_package_config_path",
+            lambda: pkg_config,
+        )
+        assert _resolve_role_from_package_manifest("nonexistent.json") is None
+
+    def test_manifest_invalid_json(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """包内 manifest JSON 解析失败时返回 None。"""
+        pkg_manifests = tmp_path / "pkg_config" / "prompts" / "manifests"
+        pkg_manifests.mkdir(parents=True)
+        (pkg_manifests / "broken.json").write_text("not json {{{", encoding="utf-8")
+        monkeypatch.setattr(
+            "dayu.cli.commands.init.resolve_package_config_path",
+            lambda: tmp_path / "pkg_config",
+        )
+        assert _resolve_role_from_package_manifest("broken.json") is None
+
+    def test_manifest_model_not_dict(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """包内 manifest 的 model 字段非 dict 时返回 None。"""
+        pkg_manifests = tmp_path / "pkg_config" / "prompts" / "manifests"
+        pkg_manifests.mkdir(parents=True)
+        (pkg_manifests / "weird.json").write_text(
+            json.dumps({"model": "string_instead_of_dict"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            "dayu.cli.commands.init.resolve_package_config_path",
+            lambda: tmp_path / "pkg_config",
+        )
+        assert _resolve_role_from_package_manifest("weird.json") is None
+
+
+# --------------------------------------------------------------------------- #
+#  _update_manifest_default_models — 额外分支
+# --------------------------------------------------------------------------- #
+
+
+class TestUpdateManifestExtraBranches:
+    """manifest 更新的额外分支覆盖。"""
+
+    def test_model_section_not_dict_skipped(self, tmp_path: Path) -> None:
+        """model section 非 dict 时跳过该文件。"""
+        manifests = tmp_path / "prompts" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / "bad.json").write_text(
+            json.dumps({"model": "not_a_dict"}), encoding="utf-8"
+        )
+        count = _update_manifest_default_models(tmp_path, "deepseek-chat", "deepseek-thinking")
+        assert count == 0
+
+    def test_stored_role_not_string_reset(self, tmp_path: Path) -> None:
+        """stored_role 非字符串时当作空字符串处理。"""
+        manifests = tmp_path / "prompts" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / "a.json").write_text(
+            json.dumps({"model": {"default_name": "mimo-v2-pro-plan", _INIT_ROLE_KEY: 42}}),
+            encoding="utf-8",
+        )
+        count = _update_manifest_default_models(tmp_path, "deepseek-chat", "deepseek-thinking")
+        assert count == 1
+        data = json.loads((manifests / "a.json").read_text(encoding="utf-8"))
+        assert data["model"]["default_name"] == "deepseek-chat"
+
+
+# --------------------------------------------------------------------------- #
+#  _prompt_provider_selection — 额外分支
+# --------------------------------------------------------------------------- #
+
+
+class TestPromptProviderSelection:
+    """供应商选择交互测试。"""
+
+    def test_eof_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """EOFError 时调用 sys.exit(1)。"""
+        monkeypatch.setattr("builtins.input", lambda *_args: (_ for _ in ()).throw(EOFError))
+        with pytest.raises(SystemExit) as exc_info:
+            _prompt_provider_selection()
+        assert exc_info.value.code == 1
+
+    def test_keyboard_interrupt_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """KeyboardInterrupt 时调用 sys.exit(1)。"""
+        def _raise_kb(*_args: str) -> str:
+            raise KeyboardInterrupt
+        monkeypatch.setattr("builtins.input", _raise_kb)
+        with pytest.raises(SystemExit) as exc_info:
+            _prompt_provider_selection()
+        assert exc_info.value.code == 1
+
+    def test_empty_input_uses_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """空输入时选择默认供应商（第一个已配置的）。"""
+        monkeypatch.setenv("MIMO_API_KEY", "existing")
+        for k in ("MIMO_PLAN_API_KEY", "MIMO_PLAN_SG_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY",
+                   "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "QWEN_API_KEY"):
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *_args: "")
+        result = _prompt_provider_selection()
+        assert result == _PROVIDER_OPTION_MIMO_PRO
+
+    def test_select_mimo_flash_option(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """显式选择 Flash 方案时返回独立方案 key。"""
+        _clear_provider_env_vars(monkeypatch)
+        monkeypatch.setattr("builtins.input", lambda *_args: "4")
+        result = _prompt_provider_selection()
+        assert result == _PROVIDER_OPTION_MIMO_FLASH
+
+    def test_invalid_non_integer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """非整数输入时调用 sys.exit(1)。"""
+        _clear_provider_env_vars(monkeypatch)
+        monkeypatch.setattr("builtins.input", lambda *_args: "abc")
+        with pytest.raises(SystemExit) as exc_info:
+            _prompt_provider_selection()
+        assert exc_info.value.code == 1
+
+    def test_out_of_range(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """编号超出范围时调用 sys.exit(1)。"""
+        _clear_provider_env_vars(monkeypatch)
+        monkeypatch.setattr("builtins.input", lambda *_args: "999")
+        with pytest.raises(SystemExit) as exc_info:
+            _prompt_provider_selection()
+        assert exc_info.value.code == 1
+
+    def test_first_configured_provider_branch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """首个已配置供应商触发 first_configured_idx 分支。"""
+        _clear_provider_env_vars(monkeypatch)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-already")
+        monkeypatch.setattr("builtins.input", lambda *_args: "")
+        result = _prompt_provider_selection()
+        assert result == _PROVIDER_OPTION_DEEPSEEK
+
+
+# --------------------------------------------------------------------------- #
+#  _prompt_api_key — 分支覆盖
+# --------------------------------------------------------------------------- #
+
+
+class TestPromptApiKey:
+    """API Key 输入交互测试。"""
+
+    def test_eof_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """EOFError 时调用 sys.exit(1)。"""
+        monkeypatch.setattr("builtins.input", lambda *_args: (_ for _ in ()).throw(EOFError))
+        with pytest.raises(SystemExit) as exc_info:
+            _prompt_api_key("MY_KEY")
+        assert exc_info.value.code == 1
+
+    def test_keyboard_interrupt_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """KeyboardInterrupt 时调用 sys.exit(1)。"""
+        def _raise_kb(*_args: str) -> str:
+            raise KeyboardInterrupt
+        monkeypatch.setattr("builtins.input", _raise_kb)
+        with pytest.raises(SystemExit) as exc_info:
+            _prompt_api_key("MY_KEY")
+        assert exc_info.value.code == 1
+
+    def test_empty_value_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """用户输入空白时调用 sys.exit(1)。"""
+        monkeypatch.setattr("builtins.input", lambda *_args: "   ")
+        with pytest.raises(SystemExit) as exc_info:
+            _prompt_api_key("MY_KEY")
+        assert exc_info.value.code == 1
+
+
+# --------------------------------------------------------------------------- #
+#  _prompt_optional_search_keys — EOF 分支
+# --------------------------------------------------------------------------- #
+
+
+class TestPromptOptionalSearchKeys:
+    """可选搜索 Key 输入测试。"""
+
+    def test_eof_interrupts_input(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """EOFError 时中断输入，返回已有结果。"""
+        for k in ("TAVILY_API_KEY", "SERPER_API_KEY", "FMP_API_KEY"):
+            monkeypatch.delenv(k, raising=False)
+        inputs = iter(["sk-test"])
+        call_count = 0
+
+        def _mock_input(prompt: str = "") -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise EOFError
+            return next(inputs)
+
+        monkeypatch.setattr("builtins.input", _mock_input)
+        result = _prompt_optional_search_keys()
+        assert len(result) >= 1
+
+
+# --------------------------------------------------------------------------- #
+#  _is_hf_hub_reachable — 异常分支
+# --------------------------------------------------------------------------- #
+
+
+class TestIsHfHubReachable:
+    """HuggingFace Hub 可达性探测测试。"""
+
+    def test_url_error_returns_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """URLError 时返回 False。"""
+        def _raise_url_error(*_args: str, **_kw: int) -> None:
+            raise urllib.error.URLError("network down")
+        monkeypatch.setattr("urllib.request.urlopen", _raise_url_error)
+        assert _is_hf_hub_reachable() is False
+
+    def test_os_error_returns_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OSError 时返回 False。"""
+        def _raise_os_error(*_args: str, **_kw: int) -> None:
+            raise OSError("connection refused")
+        monkeypatch.setattr("urllib.request.urlopen", _raise_os_error)
+        assert _is_hf_hub_reachable() is False
+
+    def test_timeout_error_returns_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """TimeoutError 时返回 False。"""
+        def _raise_timeout(*_args: str, **_kw: int) -> None:
+            raise TimeoutError("timed out")
+        monkeypatch.setattr("urllib.request.urlopen", _raise_timeout)
+        assert _is_hf_hub_reachable() is False
+
+
+# --------------------------------------------------------------------------- #
+#  _prompt_sec_user_agent
+# --------------------------------------------------------------------------- #
+
+
+class TestPromptSecUserAgent:
+    """SEC User-Agent 交互提示测试。"""
+
+    def test_returns_none_when_env_already_exists(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """环境变量已存在时直接跳过交互。"""
+
+        monkeypatch.setenv(SEC_USER_AGENT_ENV, "Demo demo@example.com")
+        monkeypatch.setattr("builtins.input", lambda *_args: (_ for _ in ()).throw(AssertionError("should not prompt")))
+
+        assert _prompt_sec_user_agent() is None
+
+    def test_returns_value_when_user_enters_agent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """用户输入有效 User-Agent 时返回键值对。"""
+
+        monkeypatch.delenv(SEC_USER_AGENT_ENV, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *_args: "Demo demo@example.com")
+
+        assert _prompt_sec_user_agent() == (SEC_USER_AGENT_ENV, "Demo demo@example.com")
+
+    def test_returns_none_when_user_skips(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """用户直接回车时返回 None。"""
+
+        monkeypatch.delenv(SEC_USER_AGENT_ENV, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *_args: "")
+
+        assert _prompt_sec_user_agent() is None
+
+
+# --------------------------------------------------------------------------- #
+#  run_init_command — 持久化失败路径与 Windows 平台分支
+# --------------------------------------------------------------------------- #
+
+
+class TestRunInitFailurePaths:
+    """run_init_command 失败路径与平台分支测试。"""
+
+    def _prepare_mocks(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """准备通用 mock 环境，返回 base 目录。"""
+        src = tmp_path / "pkg_config"
+        src.mkdir()
+        (src / "run.json").write_text("{}", encoding="utf-8")
+        manifests = src / "prompts" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / "write.json").write_text(
+            json.dumps({"model": {"default_name": "mimo-v2-pro-plan"}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "dayu.cli.commands.init.resolve_package_config_path",
+            lambda: src,
+        )
+        pkg_assets = tmp_path / "pkg_assets"
+        pkg_assets.mkdir()
+        (pkg_assets / "template.md").write_text("# t", encoding="utf-8")
+        monkeypatch.setattr(
+            "dayu.cli.commands.init.resolve_package_assets_path",
+            lambda: pkg_assets,
+        )
+        _clear_provider_env_vars(monkeypatch)
+        for k in ("TAVILY_API_KEY", "SERPER_API_KEY", "FMP_API_KEY", "HF_ENDPOINT", "HF_TOKEN"):
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.delenv(SEC_USER_AGENT_ENV, raising=False)
+        monkeypatch.setattr("dayu.cli.commands.init._is_hf_hub_reachable", lambda: True)
+        monkeypatch.setattr(
+            "dayu.cli.commands.init._run_init_prewarm",
+            lambda **_kwargs: (True, ""),
+        )
+        base = tmp_path / "workspace"
+        base.mkdir()
+        return base
+
+    def test_main_key_persist_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """主 API Key 持久化失败时跳过 manifest 更新并返回 1。"""
+        base = self._prepare_mocks(tmp_path, monkeypatch)
+        prewarm_calls: list[tuple[Path, Path]] = []
+
+        inputs = iter(["sk-test", "", "", "", "n", "", ""])
+        monkeypatch.setattr("builtins.input", lambda *_args: next(inputs))
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_provider_selection", lambda: _PROVIDER_OPTION_DEEPSEEK)
+        monkeypatch.setattr(
+            "dayu.cli.commands.init._persist_env_var",
+            lambda _k, _v: ("setx", False),
+        )
+
+        def _capture_prewarm(*, base_dir: Path, config_dir: Path) -> tuple[bool, str]:
+            prewarm_calls.append((base_dir, config_dir))
+            return True, ""
+
+        monkeypatch.setattr("dayu.cli.commands.init._run_init_prewarm", _capture_prewarm)
+
+        args = Namespace(base=str(base), overwrite=False)
+        exit_code = run_init_command(args)
+        assert exit_code == 1
+        assert prewarm_calls == []
+
+    def test_search_key_persist_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """搜索 Key 持久化失败时触发 search_persist_failed 分支。"""
+        base = self._prepare_mocks(tmp_path, monkeypatch)
+
+        inputs = iter(["sk-test", "tvly-test", "", "", "n", "", ""])
+        monkeypatch.setattr("builtins.input", lambda *_args: next(inputs))
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_provider_selection", lambda: _PROVIDER_OPTION_DEEPSEEK)
+
+        call_count = 0
+
+        def _mock_persist(k: str, v: str) -> tuple[str, bool]:
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                return "setx", False
+            return "~/.zshrc", True
+
+        monkeypatch.setattr("dayu.cli.commands.init._persist_env_var", _mock_persist)
+
+        args = Namespace(base=str(base), overwrite=False)
+        exit_code = run_init_command(args)
+        assert exit_code == 0
+
+
+class TestInitPrewarm:
+    """`dayu-cli init` 首次安装 prewarm 行为测试。"""
+
+    def _prepare_run_init_environment(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """准备 `run_init_command` 所需的最小包内配置与资产。"""
+
+        src = tmp_path / "pkg_config"
+        src.mkdir()
+        (src / "run.json").write_text("{}", encoding="utf-8")
+        manifests = src / "prompts" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / "write.json").write_text(
+            json.dumps({"model": {"default_name": "mimo-v2-pro-plan"}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "dayu.cli.commands.init.resolve_package_config_path",
+            lambda: src,
+        )
+
+        pkg_assets = tmp_path / "pkg_assets"
+        pkg_assets.mkdir()
+        (pkg_assets / "template.md").write_text("# t", encoding="utf-8")
+        monkeypatch.setattr(
+            "dayu.cli.commands.init.resolve_package_assets_path",
+            lambda: pkg_assets,
+        )
+
+        _clear_provider_env_vars(monkeypatch)
+        monkeypatch.delenv("HF_ENDPOINT", raising=False)
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+        monkeypatch.delenv(SEC_USER_AGENT_ENV, raising=False)
+        monkeypatch.setattr("dayu.cli.commands.init._is_hf_hub_reachable", lambda: True)
+        init_inputs = iter(["sk-test", "", "", "", "n", "", ""])
+        monkeypatch.setattr("builtins.input", lambda *_args: next(init_inputs))
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_provider_selection", lambda: _PROVIDER_OPTION_DEEPSEEK)
+        monkeypatch.setattr(
+            "dayu.cli.commands.init._persist_env_var",
+            lambda _k, _v: ("~/.zshrc", True),
+        )
+
+        base = tmp_path / "workspace"
+        base.mkdir()
+        return base
+
+    def test_should_run_init_prewarm_only_for_first_init(self, tmp_path: Path) -> None:
+        """仅首次初始化允许执行 prewarm。"""
+
+        base = tmp_path / "workspace"
+        base.mkdir()
+
+        assert _should_run_init_prewarm(
+            is_first_workspace_init=True,
+            overwrite=False,
+            main_key_persist_failed=False,
+        ) is True
+
+        config_dir = base / "config"
+        config_dir.mkdir()
+        assert _should_run_init_prewarm(
+            is_first_workspace_init=False,
+            overwrite=False,
+            main_key_persist_failed=False,
+        ) is False
+        assert _should_run_init_prewarm(
+            is_first_workspace_init=False,
+            overwrite=True,
+            main_key_persist_failed=False,
+        ) is False
+        assert _should_run_init_prewarm(
+            is_first_workspace_init=False,
+            overwrite=False,
+            main_key_persist_failed=True,
+        ) is False
+
+    def test_run_init_prewarm_only_imports_runtime_modules(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """prewarm 只做模块导入预热，不执行运行时装配。"""
+
+        imported_modules: list[str] = []
+
+        def _capture_import(module_name: str) -> object:
+            imported_modules.append(module_name)
+            return object()
+
+        monkeypatch.setattr("dayu.cli.commands.init.importlib.import_module", _capture_import)
+
+        success, message = _run_init_prewarm(
+            base_dir=tmp_path / "workspace",
+            config_dir=tmp_path / "workspace" / "config",
+        )
+
+        assert success is True
+        assert message == ""
+        assert imported_modules == [
+            "dayu.cli.dependency_setup",
+            "dayu.cli.interactive_ui",
+            "dayu.cli.commands.interactive",
+            "dayu.cli.commands.prompt",
+            "dayu.cli.commands.write",
+        ]
+
+    def test_run_init_runs_prewarm_only_on_first_install(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """首次安装时执行 prewarm，二次 init 不再重复执行。"""
+
+        base = self._prepare_run_init_environment(tmp_path, monkeypatch)
+        prewarm_calls: list[tuple[Path, Path]] = []
+
+        def _capture_prewarm(*, base_dir: Path, config_dir: Path) -> tuple[bool, str]:
+            prewarm_calls.append((base_dir, config_dir))
+            return True, ""
+
+        monkeypatch.setattr("dayu.cli.commands.init._run_init_prewarm", _capture_prewarm)
+
+        assert run_init_command(Namespace(base=str(base), overwrite=False)) == 0
+        assert prewarm_calls == [(base.resolve(), (base / "config").resolve())]
+
+        monkeypatch.setattr("builtins.input", lambda *_args: "")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-already-set-123456")
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-xxx")
+        monkeypatch.setenv("SERPER_API_KEY", "sp-xxx")
+        monkeypatch.setenv("FMP_API_KEY", "fmp-xxx")
+        monkeypatch.setenv("HF_ENDPOINT", "https://hf-mirror.com")
+        monkeypatch.setenv("HF_TOKEN", "hf-test-xxx")
+        monkeypatch.setenv(SEC_USER_AGENT_ENV, "Demo demo@example.com")
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_provider_selection", lambda: _PROVIDER_OPTION_DEEPSEEK)
+        assert run_init_command(Namespace(base=str(base), overwrite=False)) == 0
+        assert prewarm_calls == [(base.resolve(), (base / "config").resolve())]
+
+    def test_run_init_skips_prewarm_when_overwrite_is_true(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`--overwrite` 不属于首次安装，不执行 prewarm。"""
+
+        base = self._prepare_run_init_environment(tmp_path, monkeypatch)
+        prewarm_calls: list[tuple[Path, Path]] = []
+
+        def _capture_prewarm(*, base_dir: Path, config_dir: Path) -> tuple[bool, str]:
+            prewarm_calls.append((base_dir, config_dir))
+            return True, ""
+
+        monkeypatch.setattr("dayu.cli.commands.init._run_init_prewarm", _capture_prewarm)
+
+        assert run_init_command(Namespace(base=str(base), overwrite=False)) == 0
+        assert len(prewarm_calls) == 1
+
+        monkeypatch.setattr("builtins.input", lambda *_args: "")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-already-set-123456")
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-xxx")
+        monkeypatch.setenv("SERPER_API_KEY", "sp-xxx")
+        monkeypatch.setenv("FMP_API_KEY", "fmp-xxx")
+        monkeypatch.setenv("HF_ENDPOINT", "https://hf-mirror.com")
+        monkeypatch.setenv("HF_TOKEN", "hf-test-xxx")
+        monkeypatch.setenv(SEC_USER_AGENT_ENV, "Demo demo@example.com")
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_provider_selection", lambda: _PROVIDER_OPTION_DEEPSEEK)
+        assert run_init_command(Namespace(base=str(base), overwrite=True)) == 0
+        assert len(prewarm_calls) == 1
+
+    def test_run_init_prewarm_failure_only_warns(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """prewarm 失败只告警，不影响 init 主成功码。"""
+
+        base = self._prepare_run_init_environment(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "dayu.cli.commands.init._run_init_prewarm",
+            lambda **_kwargs: (False, "RuntimeError: prewarm failed"),
+        )
+
+        assert run_init_command(Namespace(base=str(base), overwrite=False)) == 0
+
+        captured = capsys.readouterr()
+        assert "正在预热 CLI 运行时，请稍候" in captured.out
+        assert "CLI 运行时预热失败: RuntimeError: prewarm failed" in captured.out
+        assert "不影响当前工作区初始化成功" in captured.out
+
+    def test_run_init_skips_prewarm_when_main_key_persist_fails(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """主 API Key 持久化失败时不执行 prewarm。"""
+
+        base = self._prepare_run_init_environment(tmp_path, monkeypatch)
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_provider_selection", lambda: _PROVIDER_OPTION_DEEPSEEK)
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_api_key", lambda _key: "sk-test")
+        monkeypatch.setattr("dayu.cli.commands.init._persist_env_var", lambda _k, _v: ("~/.zshrc", False))
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_optional_search_keys", lambda: [])
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_huggingface_config", lambda: [])
+
+        prewarm_calls: list[tuple[Path, Path]] = []
+
+        def _capture_prewarm(*, base_dir: Path, config_dir: Path) -> tuple[bool, str]:
+            prewarm_calls.append((base_dir, config_dir))
+            return True, ""
+
+        monkeypatch.setattr("dayu.cli.commands.init._run_init_prewarm", _capture_prewarm)
+
+        assert run_init_command(Namespace(base=str(base), overwrite=False)) == 1
+        assert prewarm_calls == []
+
+    def test_windows_setx_message(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Windows 平台持久化成功时打印 setx 提示。"""
+        base = self._prepare_run_init_environment(tmp_path, monkeypatch)
+        monkeypatch.setattr("dayu.cli.commands.init.platform.system", lambda: "Windows")
+        monkeypatch.setattr(
+            "dayu.cli.commands.init._run_init_prewarm",
+            lambda **_kwargs: (True, ""),
+        )
+
+        inputs = iter(["sk-test", "", "", "", "n", "", ""])
+        monkeypatch.setattr("builtins.input", lambda *_args: next(inputs))
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_provider_selection", lambda: _PROVIDER_OPTION_DEEPSEEK)
+        monkeypatch.setattr(
+            "dayu.cli.commands.init._persist_env_var",
+            lambda _k, _v: ("setx（重开终端生效）", True),
+        )
+
+        args = Namespace(base=str(base), overwrite=False)
+        exit_code = run_init_command(args)
+        assert exit_code == 0
+
+    def test_hf_persist_fails_sets_flag(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """HF 环境变量持久化失败时也触发 search_persist_failed。"""
+        base = self._prepare_run_init_environment(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "dayu.cli.commands.init._run_init_prewarm",
+            lambda **_kwargs: (True, ""),
+        )
+
+        inputs = iter(["sk-test", "", "", "", "y", "hf-token-val", ""])
+        monkeypatch.setattr("builtins.input", lambda *_args: next(inputs))
+        monkeypatch.setattr("dayu.cli.commands.init._prompt_provider_selection", lambda: _PROVIDER_OPTION_DEEPSEEK)
+
+        call_count = 0
+
+        def _mock_persist(k: str, v: str) -> tuple[str, bool]:
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                return "setx", False
+            return "~/.zshrc", True
+
+        monkeypatch.setattr("dayu.cli.commands.init._persist_env_var", _mock_persist)
+
+        args = Namespace(base=str(base), overwrite=False)
+        exit_code = run_init_command(args)
+        assert exit_code == 0

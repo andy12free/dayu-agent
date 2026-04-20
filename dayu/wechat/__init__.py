@@ -1,18 +1,22 @@
 """WeChat UI 包入口。"""
 
-from dayu.wechat.daemon import WeChatDaemon, WeChatDaemonConfig, WeChatReply, WeChatReplyBuilder
-from dayu.wechat.ilink_client import IlinkApiClient, IlinkApiError
 from dayu.wechat.main import main
-from dayu.wechat.state_store import FileWeChatStateStore, WeChatDaemonState
 
-__all__ = [
-    "FileWeChatStateStore",
-    "IlinkApiClient",
-    "IlinkApiError",
-    "WeChatDaemon",
-    "WeChatDaemonConfig",
-    "WeChatDaemonState",
-    "WeChatReply",
-    "WeChatReplyBuilder",
-    "main",
-]
+
+def run_main() -> int:
+    """执行 WeChat CLI 主入口。
+
+    Args:
+        无。
+
+    Returns:
+        主入口退出码。
+
+    Raises:
+        无。
+    """
+
+    return main()
+
+
+__all__ = ["main", "run_main"]

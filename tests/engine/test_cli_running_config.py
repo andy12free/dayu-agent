@@ -15,6 +15,9 @@ import pytest
 
 from dayu.contracts.cancellation import CancelledError
 from dayu.cli.arg_parsing import parse_arguments
+from dayu.cli.commands.interactive import run_interactive_command
+from dayu.cli.commands.prompt import run_prompt_command
+from dayu.cli.commands.write import run_write_command
 from dayu.cli.dependency_setup import (
     ModelName,
     RunningConfig,
@@ -32,16 +35,19 @@ from dayu.cli.dependency_setup import (
     setup_paths,
     setup_write_config,
 )
-from dayu.cli.fins_commands import _build_fins_command
+from dayu.cli.commands.fins import _build_fins_command, run_fins_command
 from dayu.cli.main import main
 from dayu.cli.interactive_state import (
     FileInteractiveStateStore,
     InteractiveSessionState,
     build_interactive_session_id,
 )
-from dayu.services.contracts import FinsSubmission
+from dayu.services.contracts import FinsSubmission, WriteRunConfig
+from dayu.services.scene_execution_acceptance import SceneExecutionAcceptancePreparer
 from dayu.services.write_service import WriteService
+from dayu.startup.workspace import WorkspaceResources
 from dayu.host.protocols import HostedExecutionGatewayProtocol
+from dayu.host import Host
 from dayu.contracts.agent_types import AgentMessage, AgentTraceIdentity
 from dayu.contracts.fins import (
     DownloadCommandPayload,
@@ -56,24 +62,25 @@ from dayu.contracts.fins import (
     UploadFilingResultData,
     UploadMaterialCommandPayload,
 )
+from dayu.contracts.tool_configs import DocToolLimits, FinsToolLimits, WebToolsConfig
 from dayu.contracts.toolset_config import build_toolset_config_snapshot
+from dayu.engine.doc_access_policy import build_effective_doc_allowed_paths
 from dayu.engine.events import content_delta, final_answer_event
 from dayu.engine.toolset_registrars import (
     register_doc_toolset as _register_doc_toolset,
     register_web_toolset as _register_web_toolset,
 )
-from dayu.execution.doc_access import build_effective_doc_allowed_paths
-from dayu.execution.doc_limits import DocToolLimits
 from dayu.execution.runtime_config import (
     AgentRuntimeConfig as AgentRunningConfig,
     OpenAIRunnerRuntimeConfig as AsyncOpenAIRunnerRunningConfig,
 )
-from dayu.execution.web_limits import WebToolsConfig
+from dayu.execution.options import ResolvedExecutionOptions
+from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.startup.config_file_resolver import ConfigFileResolver
 from dayu.startup.config_loader import ConfigLoader
 from dayu.startup.prompt_assets import FilePromptAssetStore
 from dayu.fins.toolset_registrars import register_fins_read_toolset as _register_fins_read_toolset
-from dayu.fins.tools.fins_limits import FinsToolLimits
+from dayu.services.startup_preparation import PreparedHostRuntimeDependencies
 class _CallCollector:
     """测试调用记录器。"""
 
@@ -670,15 +677,22 @@ def _raise_runtime_error_for_write_pipeline(**_kwargs: object) -> int:
 def test_main_dispatches_host_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """host 子命令应直接分发到宿主管理入口。"""
 
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(sys, "argv", ["prog", "host", "--base", str(workspace), "status"])
-    monkeypatch.setattr("dayu.cli.main.run_host_command", lambda args: 0)
-    monkeypatch.setattr("dayu.cli.main.setup_paths", lambda _args: pytest.fail("host 命令不应走 setup_paths"))
-    monkeypatch.setattr("dayu.cli.main.Log.info", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("dayu.cli.main.Log.error", lambda *_args, **_kwargs: None)
+    args = Namespace(command="host")
+    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
+    monkeypatch.setattr("dayu.cli.commands.host.run_host_command", lambda args: 0)
 
     assert main() == 0
+
+
+@pytest.mark.unit
+def test_main_dispatches_init_without_runtime_setup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """`init` 子命令不应触发运行时装配路径。"""
+
+    args = Namespace(command="init")
+    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
+    monkeypatch.setattr("dayu.cli.commands.init.run_init_command", lambda args: 7)
+
+    assert main() == 7
 
 
 def _build_args() -> Namespace:
@@ -1664,7 +1678,7 @@ def test_setup_paths_warns_and_allows_missing_filings_dir_for_agent_commands(
     workspace_dir = tmp_path / "workspace"
     workspace_dir.mkdir(parents=True, exist_ok=True)
     collector = _CallCollector()
-    monkeypatch.setattr("dayu.cli.main.Log.warning", collector.capture_warn)
+    monkeypatch.setattr("dayu.cli.dependency_setup.Log.warning", collector.capture_warn)
 
     args = Namespace(base=str(workspace_dir), ticker="aapl", command=command_name)
     paths_config = setup_paths(args)
@@ -1993,6 +2007,103 @@ def test_setup_write_config_raises_system_exit_when_retry_count_is_negative(tmp_
 
 
 @pytest.mark.unit
+def test_setup_write_config_prefers_workspace_template_when_cli_not_provided(tmp_path: Path) -> None:
+    """验证未传 `--template` 时优先使用工作区模板。"""
+
+    workspace_dir = tmp_path / "workspace"
+    (workspace_dir / "config").mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "assets").mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "assets" / "定性分析模板.md").write_text("# workspace", encoding="utf-8")
+    (workspace_dir / "portfolio" / "AAPL" / "filings").mkdir(parents=True, exist_ok=True)
+    paths_config = WorkspaceConfig(
+        workspace_dir=workspace_dir,
+        output_dir=workspace_dir / "output",
+        config_loader=ConfigLoader(ConfigFileResolver(workspace_dir / "config")),
+        prompt_asset_store=FilePromptAssetStore(ConfigFileResolver(workspace_dir / "config")),
+        ticker="AAPL",
+        has_local_filings=True,
+    )
+    args = Namespace(
+        command="write",
+        output=None,
+        template=None,
+        write_max_retries=2,
+        resume=True,
+        web_provider=None,
+        audit_model_name=None,
+        chapter=None,
+        fast=False,
+        force=False,
+        infer=False,
+    )
+    running_config = RunningConfig(
+        runner_running_config=AsyncOpenAIRunnerRunningConfig(),
+        agent_running_config=AgentRunningConfig(),
+        doc_tool_limits=DocToolLimits(),
+        fins_tool_limits=FinsToolLimits(),
+        web_tools_config=WebToolsConfig(provider="auto"),
+        tool_trace_config=ToolTraceConfig(enabled=False, output_dir=tmp_path / "trace"),
+    )
+
+    write_config = setup_write_config(args, paths_config, running_config)
+
+    assert write_config.template_path == (workspace_dir / "assets" / "定性分析模板.md")
+
+
+@pytest.mark.unit
+def test_setup_write_config_falls_back_to_package_template_when_workspace_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证工作区模板缺失时回退到包内默认模板。"""
+
+    workspace_dir = tmp_path / "workspace"
+    (workspace_dir / "config").mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "portfolio" / "AAPL" / "filings").mkdir(parents=True, exist_ok=True)
+    package_assets_dir = tmp_path / "package_assets"
+    package_assets_dir.mkdir(parents=True, exist_ok=True)
+    (package_assets_dir / "定性分析模板.md").write_text("# package", encoding="utf-8")
+    monkeypatch.setattr(
+        "dayu.cli.dependency_setup.resolve_package_assets_path",
+        lambda: package_assets_dir,
+    )
+
+    paths_config = WorkspaceConfig(
+        workspace_dir=workspace_dir,
+        output_dir=workspace_dir / "output",
+        config_loader=ConfigLoader(ConfigFileResolver(workspace_dir / "config")),
+        prompt_asset_store=FilePromptAssetStore(ConfigFileResolver(workspace_dir / "config")),
+        ticker="AAPL",
+        has_local_filings=True,
+    )
+    args = Namespace(
+        command="write",
+        output=None,
+        template=None,
+        write_max_retries=2,
+        resume=True,
+        web_provider=None,
+        audit_model_name=None,
+        chapter=None,
+        fast=False,
+        force=False,
+        infer=False,
+    )
+    running_config = RunningConfig(
+        runner_running_config=AsyncOpenAIRunnerRunningConfig(),
+        agent_running_config=AgentRunningConfig(),
+        doc_tool_limits=DocToolLimits(),
+        fins_tool_limits=FinsToolLimits(),
+        web_tools_config=WebToolsConfig(provider="auto"),
+        tool_trace_config=ToolTraceConfig(enabled=False, output_dir=tmp_path / "trace"),
+    )
+
+    write_config = setup_write_config(args, paths_config, running_config)
+
+    assert write_config.template_path == (package_assets_dir / "定性分析模板.md")
+
+
+@pytest.mark.unit
 def test_resolve_write_output_dir_uses_ticker_subdir_by_default(tmp_path: Path) -> None:
     """验证写作输出目录默认落到 `draft/{ticker}`。
 
@@ -2078,7 +2189,7 @@ def test_setup_loglevel_selects_expected_level(monkeypatch: pytest.MonkeyPatch) 
     """
 
     collector = _CallCollector()
-    monkeypatch.setattr("dayu.cli.main.Log.set_level", collector.capture_level)
+    monkeypatch.setattr("dayu.cli.dependency_setup.Log.set_level", collector.capture_level)
 
     setup_loglevel(Namespace(log_level="info", debug=False, verbose=False, info=False, quiet=False))
     setup_loglevel(Namespace(log_level=None, debug=True, verbose=False, info=False, quiet=False))
@@ -2157,22 +2268,25 @@ def test_main_interactive_path_returns_zero(monkeypatch: pytest.MonkeyPatch, tmp
         collector.mark_interactive()
         interactive_kwargs.update(kwargs)
 
-    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main.setup_paths", partial(_return_value, workspace_config))
-    monkeypatch.setattr("dayu.cli.main.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr("dayu.cli.commands.interactive.setup_loglevel", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.interactive.setup_paths", partial(_return_value, workspace_config))
+    monkeypatch.setattr(
+        "dayu.cli.commands.interactive._build_execution_options",
+        lambda _args: SimpleNamespace(model_name="deepseek-thinking"),
+    )
     fake_dependencies = _FakeCliHostDependencies(
         running_config=running_config,
         scene_model_names={"interactive": "scene-interactive-model"},
     )
     monkeypatch.setattr(
-        "dayu.cli.main._prepare_cli_host_dependencies",
+        "dayu.cli.commands.interactive._prepare_cli_host_dependencies",
         lambda **_kwargs: fake_dependencies.as_tuple(),
     )
-    monkeypatch.setattr("dayu.cli.main._build_chat_service", lambda **_kwargs: object())
-    monkeypatch.setattr("dayu.cli.main.Log.info", collector.capture_info)
-    monkeypatch.setattr("dayu.cli.main.interactive", _capture_interactive)
+    monkeypatch.setattr("dayu.cli.commands.interactive._build_chat_service", lambda **_kwargs: object())
+    monkeypatch.setattr("dayu.cli.commands.interactive.Log.info", collector.capture_info)
+    monkeypatch.setattr("dayu.cli.commands.interactive.interactive", _capture_interactive)
 
-    assert main() == 0
+    assert run_interactive_command(args) == 0
     assert collector.interactive_calls == 1
     state = FileInteractiveStateStore(tmp_path / ".dayu" / "interactive").load()
     assert state is not None
@@ -2208,12 +2322,14 @@ def test_main_interactive_path_rejects_second_instance(monkeypatch: pytest.Monke
     )
     error_logs: list[str] = []
 
-    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main.setup_paths", partial(_return_value, workspace_config))
-    monkeypatch.setattr("dayu.cli.main.setup_model_name", partial(_return_value, ModelName(model_name="mimo-v2-flash")))
-    monkeypatch.setattr("dayu.cli.main._build_execution_options", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.interactive.setup_loglevel", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.interactive.setup_paths", partial(_return_value, workspace_config))
     monkeypatch.setattr(
-        "dayu.cli.main._prepare_cli_host_dependencies",
+        "dayu.cli.commands.interactive._build_execution_options",
+        lambda _args: SimpleNamespace(model_name="deepseek-thinking"),
+    )
+    monkeypatch.setattr(
+        "dayu.cli.commands.interactive._prepare_cli_host_dependencies",
         lambda **_kwargs: _FakeCliHostDependencies(
             running_config=RunningConfig(
                 runner_running_config=AsyncOpenAIRunnerRunningConfig(),
@@ -2226,15 +2342,15 @@ def test_main_interactive_path_rejects_second_instance(monkeypatch: pytest.Monke
             scene_model_names={"interactive": "scene-interactive-model"},
         ).as_tuple(),
     )
-    monkeypatch.setattr("dayu.cli.main._build_chat_service", lambda **_kwargs: object())
+    monkeypatch.setattr("dayu.cli.commands.interactive._build_chat_service", lambda **_kwargs: object())
     monkeypatch.setattr(
-        "dayu.cli.main.StateDirSingleInstanceLock.acquire",
+        "dayu.cli.commands.interactive.StateDirSingleInstanceLock.acquire",
         lambda self: (_ for _ in ()).throw(RuntimeError("同一个 state_dir 已有运行中的 interactive 单实例锁")),
     )
-    monkeypatch.setattr("dayu.cli.main.Log.error", lambda message, **_kwargs: error_logs.append(str(message)))
-    monkeypatch.setattr("dayu.cli.main.interactive", lambda *_args, **_kwargs: pytest.fail("不应进入 interactive"))
+    monkeypatch.setattr("dayu.cli.commands.interactive.Log.error", lambda message, **_kwargs: error_logs.append(str(message)))
+    monkeypatch.setattr("dayu.cli.commands.interactive.interactive", lambda *_args, **_kwargs: pytest.fail("不应进入 interactive"))
 
-    assert main() == 1
+    assert run_interactive_command(args) == 1
     assert any("interactive 单实例锁" in message for message in error_logs)
 
 
@@ -2304,21 +2420,24 @@ def test_main_prompt_path_returns_prompt_exit_code(monkeypatch: pytest.MonkeyPat
         prompt_kwargs.update(kwargs)
         return 7
 
-    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main.setup_paths", partial(_return_value, workspace_config))
-    monkeypatch.setattr("dayu.cli.main.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr("dayu.cli.commands.prompt.setup_loglevel", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.setup_paths", partial(_return_value, workspace_config))
+    monkeypatch.setattr(
+        "dayu.cli.commands.prompt._build_execution_options",
+        lambda _args: SimpleNamespace(model_name="deepseek-thinking"),
+    )
     fake_dependencies = _FakeCliHostDependencies(
         running_config=running_config,
         scene_model_names={"prompt": "scene-prompt-model"},
     )
     monkeypatch.setattr(
-        "dayu.cli.main._prepare_cli_host_dependencies",
+        "dayu.cli.commands.prompt._prepare_cli_host_dependencies",
         lambda **_kwargs: fake_dependencies.as_tuple(),
     )
-    monkeypatch.setattr("dayu.cli.main._build_prompt_service", lambda **_kwargs: object())
-    monkeypatch.setattr("dayu.cli.main.prompt_command", _capture_prompt)
+    monkeypatch.setattr("dayu.cli.commands.prompt._build_prompt_service", lambda **_kwargs: object())
+    monkeypatch.setattr("dayu.cli.commands.prompt.prompt_command", _capture_prompt)
 
-    assert main() == 7
+    assert run_prompt_command(args) == 7
     prompt_execution_options = cast(Any, prompt_kwargs["execution_options"])
     assert prompt_kwargs["ticker"] == "AAPL"
     assert prompt_kwargs["show_thinking"] is False
@@ -2330,57 +2449,31 @@ def test_prepare_cli_host_dependencies_runs_unified_startup_recovery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """CLI Host runtime 装配后应立即执行统一 startup recovery。"""
+    """CLI Host 依赖装配应委托 Service 共享启动 API。"""
 
     workspace_config = WorkspaceConfig(
         workspace_dir=tmp_path,
         output_dir=tmp_path / "output",
         config_root=tmp_path / "config",
     )
-    fake_paths = SimpleNamespace(
-        workspace_root=tmp_path,
-        config_root=tmp_path / "config",
-        output_dir=tmp_path / "output",
-    )
-    fake_workspace = object()
-    fake_model_catalog = object()
-    fake_default_execution_options = object()
-    fake_scene_preparer = object()
-    fake_fins_runtime = object()
-    fake_host = SimpleNamespace(host_marker="cli-host")
-    recover_calls: list[tuple[str, str, str]] = []
+    fake_workspace = cast(WorkspaceResources, object())
+    fake_default_execution_options = cast(ResolvedExecutionOptions, object())
+    fake_scene_preparer = cast(SceneExecutionAcceptancePreparer, object())
+    fake_fins_runtime = cast(DefaultFinsRuntime, object())
+    fake_host = cast(Host, object())
+    captured_call: dict[str, object] = {}
 
-    monkeypatch.setattr("dayu.cli.dependency_setup.prepare_startup_paths", lambda **_kwargs: fake_paths)
-    monkeypatch.setattr("dayu.cli.dependency_setup.prepare_config_file_resolver", lambda **_kwargs: object())
     monkeypatch.setattr(
-        "dayu.cli.dependency_setup.prepare_config_loader",
-        lambda **_kwargs: SimpleNamespace(load_run_config=lambda: SimpleNamespace()),
-    )
-    monkeypatch.setattr("dayu.cli.dependency_setup.prepare_prompt_asset_store", lambda **_kwargs: object())
-    monkeypatch.setattr("dayu.cli.dependency_setup.prepare_workspace_resources", lambda **_kwargs: fake_workspace)
-    monkeypatch.setattr("dayu.cli.dependency_setup.prepare_model_catalog", lambda **_kwargs: fake_model_catalog)
-    monkeypatch.setattr(
-        "dayu.cli.dependency_setup.prepare_default_execution_options",
-        lambda **_kwargs: fake_default_execution_options,
-    )
-    monkeypatch.setattr(
-        "dayu.cli.dependency_setup.prepare_scene_execution_acceptance_preparer",
-        lambda **_kwargs: fake_scene_preparer,
-    )
-    monkeypatch.setattr("dayu.cli.dependency_setup.prepare_fins_runtime", lambda **_kwargs: fake_fins_runtime)
-    monkeypatch.setattr(
-        "dayu.cli.dependency_setup.resolve_host_config",
-        lambda **_kwargs: SimpleNamespace(
-            store_path=tmp_path / "host.sqlite3",
-            lane_config={"llm_api": 1},
-            pending_turn_resume_max_attempts=3,
-        ),
-    )
-    monkeypatch.setattr("dayu.cli.dependency_setup.Host", lambda **_kwargs: fake_host)
-    monkeypatch.setattr(
-        "dayu.cli.dependency_setup.recover_host_startup_state",
-        lambda host_admin_service, *, runtime_label, log_module: recover_calls.append(
-            (host_admin_service.host.host_marker, runtime_label, log_module)
+        "dayu.cli.dependency_setup.prepare_host_runtime_dependencies",
+        lambda **kwargs: (
+            captured_call.update(kwargs)
+            or PreparedHostRuntimeDependencies(
+                workspace=fake_workspace,
+                default_execution_options=fake_default_execution_options,
+                scene_execution_acceptance_preparer=fake_scene_preparer,
+                host=fake_host,
+                fins_runtime=fake_fins_runtime,
+            )
         ),
     )
 
@@ -2396,7 +2489,13 @@ def test_prepare_cli_host_dependencies_runs_unified_startup_recovery(
         fake_host,
         fake_fins_runtime,
     )
-    assert recover_calls == [("cli-host", "CLI Host runtime", "APP.MAIN")]
+    assert captured_call == {
+        "workspace_root": workspace_config.workspace_dir,
+        "config_root": workspace_config.config_root,
+        "execution_options": None,
+        "runtime_label": "CLI Host runtime",
+        "log_module": "APP.MAIN",
+    }
 
 
 @pytest.mark.unit
@@ -2462,21 +2561,24 @@ def test_main_prompt_path_allows_missing_filings_dir(monkeypatch: pytest.MonkeyP
         prompt_kwargs.update(kwargs)
         return 9
 
-    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main.setup_paths", partial(_return_value, workspace_config))
-    monkeypatch.setattr("dayu.cli.main.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr("dayu.cli.commands.prompt.setup_loglevel", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.setup_paths", partial(_return_value, workspace_config))
+    monkeypatch.setattr(
+        "dayu.cli.commands.prompt._build_execution_options",
+        lambda _args: SimpleNamespace(model_name="deepseek-thinking"),
+    )
     fake_dependencies = _FakeCliHostDependencies(
         running_config=running_config,
         scene_model_names={"prompt": "scene-prompt-model"},
     )
     monkeypatch.setattr(
-        "dayu.cli.main._prepare_cli_host_dependencies",
+        "dayu.cli.commands.prompt._prepare_cli_host_dependencies",
         lambda **_kwargs: fake_dependencies.as_tuple(),
     )
-    monkeypatch.setattr("dayu.cli.main._build_prompt_service", lambda **_kwargs: object())
-    monkeypatch.setattr("dayu.cli.main.prompt_command", _capture_prompt)
+    monkeypatch.setattr("dayu.cli.commands.prompt._build_prompt_service", lambda **_kwargs: object())
+    monkeypatch.setattr("dayu.cli.commands.prompt.prompt_command", _capture_prompt)
 
-    assert main() == 9
+    assert run_prompt_command(args) == 9
     assert prompt_kwargs["ticker"] == "AAPL"
 
 
@@ -2553,9 +2655,9 @@ def test_main_prompt_path_propagates_cli_options_to_mock_agent(
     monkeypatch.setattr("dayu.engine.toolset_registrars.register_web_toolset", web_tools_recorder)
     monkeypatch.setattr("dayu.engine.toolset_registrars.register_doc_toolset", doc_tools_recorder)
     monkeypatch.setattr("dayu.fins.toolset_registrars.register_fins_read_toolset", fins_read_tools_recorder)
-    monkeypatch.setattr("dayu.cli.main.Log.info", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("dayu.cli.main.Log.warning", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("dayu.cli.main.Log.error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.error", lambda *_args, **_kwargs: None)
 
     assert main() == 0
     assert recorder.agent_create_args is not None
@@ -2694,9 +2796,9 @@ def test_main_prompt_path_sparse_override_preserves_run_json_base(
     monkeypatch.setattr("dayu.engine.toolset_registrars.register_web_toolset", web_tools_recorder)
     monkeypatch.setattr("dayu.engine.toolset_registrars.register_doc_toolset", doc_tools_recorder)
     monkeypatch.setattr("dayu.fins.toolset_registrars.register_fins_read_toolset", fins_read_tools_recorder)
-    monkeypatch.setattr("dayu.cli.main.Log.info", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("dayu.cli.main.Log.warning", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("dayu.cli.main.Log.error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.error", lambda *_args, **_kwargs: None)
 
     assert main() == 0
 
@@ -2772,9 +2874,9 @@ def test_main_prompt_path_propagates_execution_permissions_to_web_tool_registrat
     monkeypatch.setattr("dayu.engine.toolset_registrars.register_web_toolset", web_tools_recorder)
     monkeypatch.setattr("dayu.engine.toolset_registrars.register_doc_toolset", doc_tools_recorder)
     monkeypatch.setattr("dayu.fins.toolset_registrars.register_fins_read_toolset", fins_read_tools_recorder)
-    monkeypatch.setattr("dayu.cli.main.Log.info", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("dayu.cli.main.Log.warning", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("dayu.cli.main.Log.error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.error", lambda *_args, **_kwargs: None)
 
     assert main() == 0
     assert recorder.messages is not None
@@ -2901,9 +3003,9 @@ def test_main_prompt_path_propagates_run_json_defaults_to_host_and_agent(
     monkeypatch.setattr("dayu.engine.toolset_registrars.register_web_toolset", web_tools_recorder)
     monkeypatch.setattr("dayu.engine.toolset_registrars.register_doc_toolset", doc_tools_recorder)
     monkeypatch.setattr("dayu.fins.toolset_registrars.register_fins_read_toolset", fins_read_tools_recorder)
-    monkeypatch.setattr("dayu.cli.main.Log.info", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("dayu.cli.main.Log.warning", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("dayu.cli.main.Log.error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.error", lambda *_args, **_kwargs: None)
 
     assert main() == 0
     assert recorder.agent_create_args is not None
@@ -3076,9 +3178,9 @@ def test_main_prompt_path_propagates_scene_manifest_prompt_assets_and_llm_model_
         lambda **_kwargs: "# SUBJECT_SLOT\n你正在分析的是 AAPL。",
     )
     monkeypatch.setattr("dayu.host.executor.build_async_agent", _MockPromptAgentBuilder(recorder))
-    monkeypatch.setattr("dayu.cli.main.Log.info", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("dayu.cli.main.Log.warning", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("dayu.cli.main.Log.error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.prompt.Log.error", lambda *_args, **_kwargs: None)
 
     assert main() == 0
     assert recorder.agent_create_args is not None
@@ -3140,8 +3242,6 @@ def test_main_non_interactive_path_returns_zero(monkeypatch: pytest.MonkeyPatch,
     args = Namespace(command=None, log_level=None, debug=False, verbose=False, info=False, quiet=False)
 
     monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main.setup_paths", partial(_return_value, workspace_config))
-    monkeypatch.setattr("dayu.cli.main.setup_model_name", partial(_return_value, model_name))
     assert main() == 0
 
 
@@ -3192,12 +3292,16 @@ def test_main_write_mode_requires_ticker(monkeypatch: pytest.MonkeyPatch, tmp_pa
         audit_model_name="deepseek-thinking",
     )
 
-    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main.setup_paths", partial(_return_value, workspace_config))
-    monkeypatch.setattr("dayu.cli.main.setup_model_name", partial(_return_value, model_name))
-    monkeypatch.setattr("dayu.cli.main.Log.error", lambda *args, **kwargs: None)
+    monkeypatch.setattr("dayu.cli.commands.write.setup_loglevel", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.write.setup_paths", partial(_return_value, workspace_config))
+    monkeypatch.setattr("dayu.cli.commands.write.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr(
+        "dayu.cli.commands.write._build_execution_options",
+        lambda _args: SimpleNamespace(model_name="deepseek-thinking"),
+    )
+    monkeypatch.setattr("dayu.cli.commands.write.Log.error", lambda *args, **kwargs: None)
 
-    assert main() == 2
+    assert run_write_command(args) == 2
 
 
 @pytest.mark.unit
@@ -3249,12 +3353,16 @@ def test_main_write_summary_mode_requires_ticker(monkeypatch: pytest.MonkeyPatch
     )
 
     collector = _CallCollector()
-    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main.setup_paths", partial(_return_value, workspace_config))
-    monkeypatch.setattr("dayu.cli.main.setup_model_name", partial(_return_value, model_name))
-    monkeypatch.setattr("dayu.cli.main.Log.error", collector.capture_error)
+    monkeypatch.setattr("dayu.cli.commands.write.setup_loglevel", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.write.setup_paths", partial(_return_value, workspace_config))
+    monkeypatch.setattr("dayu.cli.commands.write.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr(
+        "dayu.cli.commands.write._build_execution_options",
+        lambda _args: SimpleNamespace(model_name="deepseek-thinking"),
+    )
+    monkeypatch.setattr("dayu.cli.commands.write.Log.error", collector.capture_error)
 
-    assert main() == 2
+    assert run_write_command(args) == 2
     assert any("write --summary 模式要求必须提供 --ticker" in item for item in collector.error_logs)
 
 
@@ -3330,13 +3438,17 @@ def test_main_write_summary_mode_calls_print_report(monkeypatch: pytest.MonkeyPa
             captured_output_dir["value"] = output_dir
             return 6
 
-    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main.setup_paths", partial(_return_value, workspace_config))
-    monkeypatch.setattr("dayu.cli.main.setup_model_name", partial(_return_value, model_name))
-    monkeypatch.setattr("dayu.cli.main.WriteService.print_report", _FakeWriteService.print_report)
-    monkeypatch.setattr("dayu.cli.main.run_write_pipeline", lambda **_kwargs: pytest.fail("summary 分支不应进入写作流水线"))
+    monkeypatch.setattr("dayu.cli.commands.write.setup_loglevel", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.write.setup_paths", partial(_return_value, workspace_config))
+    monkeypatch.setattr("dayu.cli.commands.write.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr(
+        "dayu.cli.commands.write._build_execution_options",
+        lambda _args: SimpleNamespace(model_name="deepseek-thinking"),
+    )
+    monkeypatch.setattr("dayu.cli.commands.write.WriteService.print_report", _FakeWriteService.print_report)
+    monkeypatch.setattr("dayu.cli.commands.write.run_write_pipeline", lambda **_kwargs: pytest.fail("summary 分支不应进入写作流水线"))
 
-    assert main() == 6
+    assert run_write_command(args) == 6
     assert captured_output_dir["value"] == (tmp_path / "draft" / "AAPL").resolve()
 
 
@@ -3382,7 +3494,7 @@ def test_main_write_mode_calls_pipeline(monkeypatch: pytest.MonkeyPatch, tmp_pat
         info=False,
         quiet=False,
         output=str(tmp_path / "draft"),
-        template="./定性分析模板.md",
+        template=None,
         write_max_retries=2,
         resume=True,
         web_provider="auto",
@@ -3390,22 +3502,100 @@ def test_main_write_mode_calls_pipeline(monkeypatch: pytest.MonkeyPatch, tmp_pat
     )
 
     collector = _CallCollector()
-    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main.setup_paths", partial(_return_value, workspace_config))
-    monkeypatch.setattr("dayu.cli.main.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr("dayu.cli.commands.write.setup_loglevel", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.write.setup_paths", partial(_return_value, workspace_config))
+    monkeypatch.setattr("dayu.cli.commands.write.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr(
+        "dayu.cli.commands.write._build_execution_options",
+        lambda _args: SimpleNamespace(model_name="deepseek-thinking"),
+    )
     fake_dependencies = _FakeCliHostDependencies(running_config=running_config)
     monkeypatch.setattr(
-        "dayu.cli.main._prepare_cli_host_dependencies",
+        "dayu.cli.commands.write._prepare_cli_host_dependencies",
         lambda **_kwargs: fake_dependencies.as_tuple(),
     )
-    monkeypatch.setattr("dayu.cli.main._build_write_service", lambda **_kwargs: object())
-    monkeypatch.setattr("dayu.cli.main.Log.info", collector.capture_info)
-    monkeypatch.setattr("dayu.cli.main.Log.warn", collector.capture_warn)
-    monkeypatch.setattr("dayu.cli.main.run_write_pipeline", lambda **_kwargs: 4)
+    monkeypatch.setattr("dayu.cli.commands.write._build_write_service", lambda **_kwargs: object())
+    monkeypatch.setattr("dayu.cli.commands.write.Log.info", collector.capture_info)
+    monkeypatch.setattr("dayu.cli.commands.write.Log.warn", collector.capture_warn)
+    monkeypatch.setattr("dayu.cli.commands.write.run_write_pipeline", lambda **_kwargs: 4)
 
-    assert main() == 4
+    assert run_write_command(args) == 4
     assert any("写作流水线启动" in item for item in collector.info_logs)
     assert any("写作流水线结束但返回非零" in item for item in collector.warn_logs)
+
+
+@pytest.mark.unit
+def test_main_write_mode_uses_resolved_company_name_and_normalized_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """验证写作 CLI 会传递公司名而非 ticker，并显式归一化主写作模型覆盖名。"""
+
+    filings_dir = tmp_path / "portfolio" / "AAPL" / "filings"
+    filings_dir.mkdir(parents=True, exist_ok=True)
+    workspace_config = WorkspaceConfig(
+        workspace_dir=tmp_path,
+        output_dir=tmp_path / "output",
+        config_loader=ConfigLoader(ConfigFileResolver(tmp_path / "config")),
+        prompt_asset_store=FilePromptAssetStore(ConfigFileResolver(tmp_path / "config")),
+        ticker="AAPL",
+        has_local_filings=True,
+    )
+    running_config = RunningConfig(
+        runner_running_config=AsyncOpenAIRunnerRunningConfig(),
+        agent_running_config=AgentRunningConfig(),
+        doc_tool_limits=DocToolLimits(),
+        fins_tool_limits=FinsToolLimits(),
+        web_tools_config=WebToolsConfig(provider="auto"),
+        tool_trace_config=ToolTraceConfig(enabled=False, output_dir=tmp_path / "trace"),
+    )
+    captured_write_config: dict[str, object] = {}
+    args = Namespace(
+        command="write",
+        log_level=None,
+        debug=False,
+        verbose=False,
+        info=False,
+        quiet=False,
+        output=str(tmp_path / "draft"),
+        template=None,
+        write_max_retries=2,
+        resume=True,
+        web_provider="auto",
+        audit_model_name="deepseek-thinking",
+        model_name=None,
+    )
+
+    monkeypatch.setattr("dayu.cli.commands.write.setup_loglevel", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.write.setup_paths", partial(_return_value, workspace_config))
+    monkeypatch.setattr(
+        "dayu.cli.commands.write.setup_model_name",
+        partial(_return_value, ModelName(model_name="")),
+    )
+    monkeypatch.setattr(
+        "dayu.cli.commands.write._build_execution_options",
+        lambda _args: SimpleNamespace(model_name=None),
+    )
+    fake_dependencies = _FakeCliHostDependencies(running_config=running_config)
+    fake_dependencies.fins_runtime = SimpleNamespace(
+        get_company_name=lambda *_args, **_kwargs: "Apple Inc.",
+        get_company_meta_summary=lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        "dayu.cli.commands.write._prepare_cli_host_dependencies",
+        lambda **_kwargs: fake_dependencies.as_tuple(),
+    )
+    monkeypatch.setattr("dayu.cli.commands.write._build_write_service", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        "dayu.cli.commands.write.run_write_pipeline",
+        lambda **kwargs: captured_write_config.update({"write_config": kwargs["write_config"]}) or 0,
+    )
+
+    assert run_write_command(args) == 0
+    write_config = cast(WriteRunConfig, captured_write_config["write_config"])
+    assert write_config.company == "Apple Inc."
+    assert write_config.ticker == "AAPL"
+    assert write_config.write_model_override_name == ""
 
 
 @pytest.mark.unit
@@ -3452,7 +3642,7 @@ def test_main_write_mode_logs_success_when_pipeline_returns_zero(
         info=False,
         quiet=False,
         output=str(tmp_path / "draft"),
-        template="./定性分析模板.md",
+        template=None,
         write_max_retries=2,
         resume=True,
         web_provider="auto",
@@ -3460,20 +3650,24 @@ def test_main_write_mode_logs_success_when_pipeline_returns_zero(
     )
 
     collector = _CallCollector()
-    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main.setup_paths", partial(_return_value, workspace_config))
-    monkeypatch.setattr("dayu.cli.main.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr("dayu.cli.commands.write.setup_loglevel", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.write.setup_paths", partial(_return_value, workspace_config))
+    monkeypatch.setattr("dayu.cli.commands.write.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr(
+        "dayu.cli.commands.write._build_execution_options",
+        lambda _args: SimpleNamespace(model_name="deepseek-thinking"),
+    )
     fake_dependencies = _FakeCliHostDependencies(running_config=running_config)
     monkeypatch.setattr(
-        "dayu.cli.main._prepare_cli_host_dependencies",
+        "dayu.cli.commands.write._prepare_cli_host_dependencies",
         lambda **_kwargs: fake_dependencies.as_tuple(),
     )
-    monkeypatch.setattr("dayu.cli.main._build_write_service", lambda **_kwargs: object())
-    monkeypatch.setattr("dayu.cli.main.Log.info", collector.capture_info)
-    monkeypatch.setattr("dayu.cli.main.Log.warn", collector.capture_warn)
-    monkeypatch.setattr("dayu.cli.main.run_write_pipeline", lambda **_kwargs: 0)
+    monkeypatch.setattr("dayu.cli.commands.write._build_write_service", lambda **_kwargs: object())
+    monkeypatch.setattr("dayu.cli.commands.write.Log.info", collector.capture_info)
+    monkeypatch.setattr("dayu.cli.commands.write.Log.warn", collector.capture_warn)
+    monkeypatch.setattr("dayu.cli.commands.write.run_write_pipeline", lambda **_kwargs: 0)
 
-    assert main() == 0
+    assert run_write_command(args) == 0
     assert any("写作流水线完成: exit_code=0" in item for item in collector.info_logs)
     assert not collector.warn_logs
 
@@ -3522,7 +3716,7 @@ def test_main_write_mode_logs_elapsed_when_pipeline_raises(
         info=False,
         quiet=False,
         output=str(tmp_path / "draft"),
-        template="./定性分析模板.md",
+        template=None,
         write_max_retries=2,
         resume=True,
         web_provider="auto",
@@ -3531,20 +3725,24 @@ def test_main_write_mode_logs_elapsed_when_pipeline_raises(
 
     collector = _CallCollector()
 
-    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main.setup_paths", partial(_return_value, workspace_config))
-    monkeypatch.setattr("dayu.cli.main.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr("dayu.cli.commands.write.setup_loglevel", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.write.setup_paths", partial(_return_value, workspace_config))
+    monkeypatch.setattr("dayu.cli.commands.write.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr(
+        "dayu.cli.commands.write._build_execution_options",
+        lambda _args: SimpleNamespace(model_name="deepseek-thinking"),
+    )
     fake_dependencies = _FakeCliHostDependencies(running_config=running_config)
     monkeypatch.setattr(
-        "dayu.cli.main._prepare_cli_host_dependencies",
+        "dayu.cli.commands.write._prepare_cli_host_dependencies",
         lambda **_kwargs: fake_dependencies.as_tuple(),
     )
-    monkeypatch.setattr("dayu.cli.main._build_write_service", lambda **_kwargs: object())
-    monkeypatch.setattr("dayu.cli.main.Log.info", collector.capture_info)
-    monkeypatch.setattr("dayu.cli.main.Log.error", collector.capture_error)
-    monkeypatch.setattr("dayu.cli.main.run_write_pipeline", _raise_runtime_error_for_write_pipeline)
+    monkeypatch.setattr("dayu.cli.commands.write._build_write_service", lambda **_kwargs: object())
+    monkeypatch.setattr("dayu.cli.commands.write.Log.info", collector.capture_info)
+    monkeypatch.setattr("dayu.cli.commands.write.Log.error", collector.capture_error)
+    monkeypatch.setattr("dayu.cli.commands.write.run_write_pipeline", _raise_runtime_error_for_write_pipeline)
 
-    assert main() == 2
+    assert run_write_command(args) == 2
     assert any("写作模式执行失败: elapsed=" in item for item in collector.error_logs)
 
 
@@ -3582,7 +3780,7 @@ def test_main_write_returns_130_when_run_write_pipeline_is_cancelled(
         info=False,
         quiet=False,
         output=str(tmp_path / "draft"),
-        template="./定性分析模板.md",
+        template=None,
         write_max_retries=2,
         resume=True,
         web_provider="auto",
@@ -3591,12 +3789,16 @@ def test_main_write_returns_130_when_run_write_pipeline_is_cancelled(
 
     collector = _CallCollector()
 
-    monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main.setup_paths", partial(_return_value, workspace_config))
-    monkeypatch.setattr("dayu.cli.main.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr("dayu.cli.commands.write.setup_loglevel", lambda _args: None)
+    monkeypatch.setattr("dayu.cli.commands.write.setup_paths", partial(_return_value, workspace_config))
+    monkeypatch.setattr("dayu.cli.commands.write.setup_model_name", partial(_return_value, model_name))
+    monkeypatch.setattr(
+        "dayu.cli.commands.write._build_execution_options",
+        lambda _args: SimpleNamespace(model_name="deepseek-thinking"),
+    )
     fake_dependencies = _FakeCliHostDependencies(running_config=running_config)
     monkeypatch.setattr(
-        "dayu.cli.main._prepare_cli_host_dependencies",
+        "dayu.cli.commands.write._prepare_cli_host_dependencies",
         lambda **_kwargs: fake_dependencies.as_tuple(),
     )
 
@@ -3624,18 +3826,18 @@ def test_main_write_returns_130_when_run_write_pipeline_is_cancelled(
             return cancel_callback()
 
     monkeypatch.setattr(
-        "dayu.cli.main._build_write_service",
+        "dayu.cli.commands.write._build_write_service",
         lambda **_kwargs: WriteService(
             host=cast(HostedExecutionGatewayProtocol, _CancellingWriteHost()),
             workspace=cast(Any, fake_dependencies.workspace),
             scene_execution_acceptance_preparer=cast(Any, fake_dependencies.scene_execution_acceptance_preparer),
         ),
     )
-    monkeypatch.setattr("dayu.cli.main.Log.info", collector.capture_info)
-    monkeypatch.setattr("dayu.cli.main.Log.warn", collector.capture_warn)
-    monkeypatch.setattr("dayu.cli.main.Log.error", collector.capture_error)
+    monkeypatch.setattr("dayu.cli.commands.write.Log.info", collector.capture_info)
+    monkeypatch.setattr("dayu.cli.commands.write.Log.warn", collector.capture_warn)
+    monkeypatch.setattr("dayu.cli.commands.write.Log.error", collector.capture_error)
 
-    assert main() == 130
+    assert run_write_command(args) == 130
     assert any("写作模式已取消: exit_code=130" in item for item in collector.warn_logs)
     assert not any("写作流水线结束但返回非零" in item for item in collector.warn_logs)
 
@@ -3680,12 +3882,12 @@ def test_main_fins_command_bypasses_setup_paths(monkeypatch: pytest.MonkeyPatch)
     )
 
     monkeypatch.setattr("dayu.cli.main.parse_arguments", partial(_return_value, args))
-    monkeypatch.setattr("dayu.cli.main._run_fins_command", lambda _args: 0)
+    monkeypatch.setattr("dayu.cli.commands.fins.run_fins_command", lambda _args: 0)
 
     def _fail_setup_paths(_args: object) -> object:
         raise AssertionError("fins 命令不应调用 setup_paths")
 
-    monkeypatch.setattr("dayu.cli.main.setup_paths", _fail_setup_paths)
+    monkeypatch.setattr("dayu.cli.commands.interactive.setup_paths", _fail_setup_paths)
 
     assert main() == 0
 
@@ -3699,7 +3901,7 @@ def test_build_fins_command_normalizes_download_payload(monkeypatch: pytest.Monk
         namespace.ticker = "BABA"
         namespace.ticker_aliases = ["9988", "9988.HK"]
 
-    monkeypatch.setattr("dayu.cli.fins_commands.prepare_cli_args", _fake_prepare_cli_args)
+    monkeypatch.setattr("dayu.cli.commands.fins.prepare_cli_args", _fake_prepare_cli_args)
 
     command = _build_fins_command(
         Namespace(
@@ -3739,7 +3941,7 @@ def test_build_fins_command_preserves_upload_filing_infer_results(
         namespace.company_name = "Apple Inc."
         namespace.ticker_aliases = ["AAPL.US"]
 
-    monkeypatch.setattr("dayu.cli.fins_commands.prepare_cli_args", _fake_prepare_cli_args)
+    monkeypatch.setattr("dayu.cli.commands.fins.prepare_cli_args", _fake_prepare_cli_args)
 
     command = _build_fins_command(
         Namespace(
@@ -3839,7 +4041,7 @@ def test_build_fins_command_allows_upload_material_delete_without_files(tmp_path
 
 @pytest.mark.unit
 def test_run_fins_command_stream_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """验证 `_run_fins_command` 可消费流式结果并输出最终摘要。"""
+    """验证 `run_fins_command` 可消费流式结果并输出最终摘要。"""
 
     class _FakeService:
         def __init__(self) -> None:
@@ -3870,8 +4072,8 @@ def test_run_fins_command_stream_path(monkeypatch: pytest.MonkeyPatch, tmp_path:
 
             return FinsSubmission(session_id="test-session", execution=_stream())
 
-    monkeypatch.setattr("dayu.cli.fins_commands._build_fins_ops_service", lambda _args: _FakeService())
-    monkeypatch.setattr("dayu.cli.fins_commands.format_fins_cli_result", lambda command, result: f"{command.value}:{result.status}")
+    monkeypatch.setattr("dayu.cli.commands.fins._build_fins_ops_service", lambda _args: _FakeService())
+    monkeypatch.setattr("dayu.cli.commands.fins.format_fins_cli_result", lambda command, result: f"{command.value}:{result.status}")
 
     args = Namespace(
         command="download",
@@ -3889,7 +4091,7 @@ def test_run_fins_command_stream_path(monkeypatch: pytest.MonkeyPatch, tmp_path:
         quiet=False,
     )
 
-    assert __import__("dayu.cli.main", fromlist=["dummy"])._run_fins_command(args) == 0
+    assert run_fins_command(args) == 0
     output = capsys.readouterr().out
     assert "download:ok" in output
 
@@ -3951,10 +4153,10 @@ def test_run_fins_command_upload_stream_logs_progress_at_info(
         del module
         verbose_lines.append(message)
 
-    monkeypatch.setattr("dayu.cli.fins_commands._build_fins_ops_service", lambda _args: _FakeService())
-    monkeypatch.setattr("dayu.cli.fins_commands.format_fins_cli_result", lambda command, result: f"{command.value}:{result.status}")
-    monkeypatch.setattr("dayu.cli.main.Log.info", _capture_info)
-    monkeypatch.setattr("dayu.cli.main.Log.verbose", _capture_verbose)
+    monkeypatch.setattr("dayu.cli.commands.fins._build_fins_ops_service", lambda _args: _FakeService())
+    monkeypatch.setattr("dayu.cli.commands.fins.format_fins_cli_result", lambda command, result: f"{command.value}:{result.status}")
+    monkeypatch.setattr("dayu.cli.commands.fins.Log.info", _capture_info)
+    monkeypatch.setattr("dayu.cli.commands.fins.Log.verbose", _capture_verbose)
 
     args = Namespace(
         command="upload_filing",
@@ -3977,7 +4179,7 @@ def test_run_fins_command_upload_stream_logs_progress_at_info(
         quiet=False,
     )
 
-    assert __import__("dayu.cli.main", fromlist=["dummy"])._run_fins_command(args) == 0
+    assert run_fins_command(args) == 0
     output = capsys.readouterr().out
     assert "upload_filing:ok" in output
     assert any("[upload_filing] upload_started ticker=AAPL action=create file_count=1" in line for line in info_lines)
@@ -4037,8 +4239,8 @@ def test_run_fins_command_download_allows_missing_filings_dir(
 
             return FinsSubmission(session_id="test-session", execution=_stream())
 
-    monkeypatch.setattr("dayu.cli.fins_commands._build_fins_ops_service", lambda _args: _FakeService())
-    monkeypatch.setattr("dayu.cli.fins_commands.format_fins_cli_result", lambda command, result: f"{command.value}:{result.status}")
+    monkeypatch.setattr("dayu.cli.commands.fins._build_fins_ops_service", lambda _args: _FakeService())
+    monkeypatch.setattr("dayu.cli.commands.fins.format_fins_cli_result", lambda command, result: f"{command.value}:{result.status}")
 
     args = Namespace(
         command="download",
@@ -4057,6 +4259,6 @@ def test_run_fins_command_download_allows_missing_filings_dir(
         quiet=False,
     )
 
-    assert __import__("dayu.cli.main", fromlist=["dummy"])._run_fins_command(args) == 0
+    assert run_fins_command(args) == 0
     output = capsys.readouterr().out
     assert "download:ok" in output

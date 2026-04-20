@@ -20,6 +20,7 @@
   - `tests/engine/test_web_playwright_backend.py` 负责守住 `dayu.engine.tools.web_playwright_backend` 的真源边界，包括浏览器单例、子进程 worker、资源路由与关闭/终止收口
 - `tests/fins/`
   - Fins direct operation、窄仓储、processor、tool service 测试
+  - `tests/integration/fins/test_fins_tools_ground_truth.py` 依赖仓库内 `workspace/` 的真实 source 文档样本与 `tests/fixtures/fins/ground_truth/` 基线；当 CI 或干净环境里缺少这批本地样本时，应显式 `skip`，不能把“样本未准备”误报成产品回归
   - `tests/fins/test_sec_pipeline_helpers.py` 与 `tests/fins/test_sec_rebuild_workflow.py` 共同守住 source fiscal 真源边界：download/source 层禁止从 `report_date`/`filing_date` 硬猜 fiscal 字段，尤其是 6-K / 6-K/A 不得猜 `fiscal_year/fiscal_period`，rebuild 在新推断为空时也不得继续沿用 previous_meta 中的旧猜测值
   - `tests/fins/test_fins_tools_service.py` 与 `tests/fins/test_fins_tools_service_helpers_coverage.py` 共同守住消费侧 fiscal 边界：`list_documents()` 不得再仅凭 `report_date` 为 10-Q 回填季度，也不得为其他 source 文档回填空的 `fiscal_year`；当前只允许保留表单内生且不依赖日期猜测的低风险回退（如 `10-K/20-F -> FY`）
   - `tests/fins/test_fins_runtime_tool_service.py` 还要守住 `FinsToolService` 的构造期实例不变量：runtime 返回的真实 service 必须在 `__init__` 中声明实例级缓存（如 `_meta_cache`），不能把属性存在性延后到读路径里的 `hasattr` 懒初始化
@@ -35,6 +36,8 @@
 
 另外：
 - `tests/fixtures/` 放测试数据
+- `tests/engine/test_docling_processor_integration.py`、`tests/fins/test_docling_upload_service_integration.py`、`tests/engine/test_web_fetch_docling_integration.py` 是问题 2 第一批真实集成测试，必须直接走真实 Docling 执行链，不允许通过 monkeypatch `DocumentConverter` 或 fake `DoclingDocument` 伪造通过
+- 仓库根 `tests/` 明确作为本地测试包维护，避免干净虚拟环境里第三方同名 `tests` 包抢占导入解析，导致 `pyright` 或测试辅助模块引用漂移到 `site-packages`
 
 ## 2. 运行方式
 
@@ -73,6 +76,14 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 
 例如这次主链收口后，已经删除的旧装配层、旧 runtime facade、旧能力注入链，都不应继续保留对应测试。
 
+真实 Docling/PDF 集成测试也遵守同一规则：
+
+- 必须使用固定 fixture
+- 必须走真实第三方执行链
+- 表格退化不可接受，不能只断言“返回非空字符串”
+- 当前 Dayu 为避免 Apple Silicon 上 Docling 自动选择 MPS 触发 OOM，默认在 macOS 上把 PDF 转换固定到 CPU；若需要显式验证其他设备，可通过环境变量 `DAYU_DOCLING_DEVICE=auto|cpu|cuda|mps|xpu` 覆盖
+- 与此对应，unit test 若只想隔离 Docling 转换结果，应 patch `build_docling_pdf_converter()` 这类项目内真源 seam，不要继续直接 patch 第三方 `DocumentConverter` 类
+
 ### 3.2 Service / Host / Agent 路径守护
 
 涉及 Agent 路径改动时，优先补这些测试：
@@ -95,6 +106,9 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 其中：
 - `test_web_routes.py` 负责守住 Web 依赖装配已经收口到 `fastapi_app` 的显式窄依赖注入，router 工厂不再回退到全局 service locator 或旧 `Application` API。
 - `test_chat_service.py`、`test_fins_service.py` 与 `test_web_routes.py` 还要共同守住请求受理时机：`Service.submit_*()` 必须在返回 submission 前完成同步校验，校验失败时不得创建新的 Host session，Web 入口也不得返回 `202 Accepted` 或启动后台消费任务。
+- `tests/application/test_console_output.py` 负责守住 CLI / WeChat / render 入口的标准流容错边界：在非 UTF-8 终端里打印中文 help 或错误文案时不得因 `UnicodeEncodeError` 崩溃。
+- `tests/cli/test_init_command.py` 还要守住 `dayu-cli init` 的交互输入边界：测试不得隐式依赖开发机已有的 `SEC_USER_AGENT` 等环境变量短路交互流程，凡是验证完整 `run_init_command()` 路径的用例，都应显式 `delenv/setenv` 相关变量并提供完整输入序列。
+- `tests/application/test_cancellation_bridge.py` 与 `tests/engine/test_async_openai_runner_utils.py` 这类并发/超时测试，不得把 0.08s、0.2s 这类固定 sleep 当成必然成立的完成信号；应使用带超时的轮询等待来守住语义，避免 CI runner 时序抖动造成伪失败。
 - `test_web_routes.py` 还要守住 Web 的客户端错误语义：像 `PromptService.submit()` 这类已经在 Service 边界同步抛出的 `ValueError`，router 必须映射成 `4xx`，不能漏成 `500`。
 - `test_web_routes.py` 还要守住 `/api/write` 的未支持语义：当 Web 当前不支持在线写作时，route 必须显式返回 `501`，不能再用 `202` / `accepted=true` 伪装成已受理。
 - `test_fins_service.py`、`test_sec_process_workflow.py`、`test_sec_pipeline_process_filing_source.py`、`test_cn_pipeline_process.py` 与 `test_tool_snapshot_export.py` 还要共同守住 Fins 同步取消传播链路：`Host` 的取消状态只能以窄 `cancel_checker` 形式从 `FinsService -> FinsRuntime -> Pipeline` 下传，`process_filing/process_material` 必须在单文档决策、批量 stream 文档边界和工具快照导出阶段及时抛出 `CancelledError` 或收口为 cancelled，不能等整个同步 direct operation 结束后才统一收口。
@@ -170,7 +184,9 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 - `test_write_pipeline.py` 还要守住证据锚点轻量修复的可观测性边界：`maybe_rewrite_evidence_anchors()` 即使在后验校验失败回退原文时，也必须把 `attempted/applied/failure_reason` 显式写入 `process_state.latest_anchor_rewrite` 与历史记录，不能再让调用方只能靠正文是否变化去猜测“未尝试”和“尝试失败”。
 - `test_write_pipeline.py` 还要守住 manifest 文件锁的跨平台边界：`artifact_store._manifest_file_lock()` 在 POSIX 必须继续走 `fcntl.flock()`，在 Windows 必须改用 `msvcrt.locking()` 提供真实互斥；其中 blocking 语义必须显式轮询直到拿到锁，不能退回 `LK_LOCK` 那种有限次重试；如果当前平台两种实现都不可用，也必须显式失败，不能静默跳过锁操作。
 - `test_write_pipeline.py` 还要守住审计模块拆分边界：`audit_formatting.py` 只放 Markdown 文本操作（标题/证据行/内容提取/patch 匹配），`audit_rules.py` 只放审计决策真源（解析/规则/修复合同/复核合并），`audit_evidence_rewriter.py` 只放证据锚点重写。三个模块之间的依赖方向是 `formatting ← rules` 和 `formatting ← evidence_rewriter → rules`，不允许反向。
-- `test_cli_running_config.py` 和 `test_cli_interactive_coverage.py` 还要守住 CLI 模块拆分边界：`arg_parsing.py` 只放 argparse 参数定义和解析器构建，`dependency_setup.py` 只放数据类型定义、配置解析和 Service 构建，`fins_commands.py` 只放财报命令构建和执行，`main.py` 只做命令分发。monkeypatch 路径必须指向被调用函数所在的实际模块命名空间（例如 `_build_fins_ops_service` 在 `fins_commands` 命名空间被调用，monkeypatch 应指向 `dayu.cli.fins_commands._build_fins_ops_service`），不允许通过包级 re-export 绕行。
+- `test_cli_running_config.py` 和 `test_cli_interactive_coverage.py` 还要守住 CLI 模块拆分边界：`arg_parsing.py` 只放 argparse 参数定义和解析器构建，`dependency_setup.py` 只放数据类型定义、配置解析和 Service 构建，`commands/` 承担各子命令执行，`main.py` 只做命令分发。monkeypatch 路径必须指向被调用函数所在的实际模块命名空间（例如 `_build_fins_ops_service` 在 `dayu.cli.commands.fins` 被调用，patch 应指向 `dayu.cli.commands.fins._build_fins_ops_service`），不允许通过包级 re-export 或旧 `main.py` seam 绕行。
+- `test_wechat_main.py` 还要守住 WeChat 模块拆分边界：`arg_parsing.py` 只负责参数解析与上下文收口，`runtime.py` 只负责 WeChat 运行时装配与 service/runtime helper，`commands/` 承担 `login / run / service` 子命令执行，`main.py` 只做命令分发。monkeypatch 必须 patch 到真实被调用模块（例如 `_has_persisted_wechat_login` 在 `dayu.wechat.commands.service` 被调用时，应 patch `dayu.wechat.commands.service._has_persisted_wechat_login`，不能回退去 patch 旧 `main.py` seam 或其他转发层）。
+- `test_entrypoints.py` 还要守住 CLI / WeChat 的冷启动边界：导入 `dayu.cli.main` 时不得抢先导入 `dayu.cli.commands.*`、`dependency_setup` 这类重运行时模块，导入 `dayu.wechat.main` 时也不得提前拉起 `dayu.wechat.daemon`；`--help` 与 `dayu-cli init` 这类薄入口必须继续保持“主入口只分发、命令模块按需导入”的结构。
 - `test_chat_service.py` 这类 Service/Host 边界测试里，如果断言必须观察 Host 内部 stub（如 `_executor`、`_run_registry`、`_pending_turn_store`），应先通过测试 helper 把 `ConversationalExecutionGatewayProtocol` 显式收窄到测试用具体 `Host` / stub 类型；不要把私有属性访问直接散落在测试正文里。
 - `tests/application/conftest.py` 这类共享夹具文件必须直接跟随 `HostExecutorProtocol` / `SessionRegistryProtocol` 演进；像 `StubHostExecutor.run_operation_stream/run_operation_sync` 这类泛型返回签名、以及 `StubSessionRegistry.close_idle_sessions()` 这类新协议方法，应优先在共享夹具真源补齐，而不是在每个下游测试里重复 `cast` 或 `type: ignore`。
 - 项目级 `tests/conftest.py` 这类 import 兼容夹具若需要预加载模块，也要先显式断言 `ModuleSpec/loader` 非空，再在 `ModuleType` 边界集中 `cast(Any, module)` 后补动态别名；不要把 `spec.loader` 的可空分支或动态属性赋值散落到正文。

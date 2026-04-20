@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import hashlib
 import html
+import inspect
 import json
 import os
 import posixpath
@@ -31,17 +32,19 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
-from typing import Any, AsyncIterator, BinaryIO, Callable, Literal, Optional
+from typing import Any, AsyncIterator, Awaitable, BinaryIO, Callable, Literal, Optional, TypeVar, cast, overload
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
 import httpx
 from dayu.workspace_paths import build_sec_throttle_dir
+from dayu.contracts.env_keys import SEC_USER_AGENT_ENV
 
 if sys.platform != "win32":
     import fcntl
 
 from dayu.log import Log
+from dayu.fins._converters import normalize_optional_text, optional_int
 from dayu.fins.domain.document_models import FileObjectMeta
 
 SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -59,8 +62,7 @@ BROWSE_EDGAR_TICKER_ATOM_URL = (
 )
 
 DEFAULT_SLEEP_SECONDS = 0.2
-DEFAULT_USER_AGENT = "Codex Fins Downloader support@example.com"
-SEC_USER_AGENT_ENV = "SEC_USER_AGENT"
+_UNCONFIGURED_USER_AGENT = "DayuAgent/1.0 unconfigured@example.com"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_RETRIES = 3
 RETRY_BACKOFF_BASE_SECONDS = 0.8
@@ -79,6 +81,8 @@ _SEC_THROTTLE_RECOVERY_SECONDS = 600.0
 _SEC_THROTTLE_MAX_RETRIES = 3
 _ETAG_WEAK_PREFIX = "W/"
 _ETAG_GZIP_SUFFIX = "-gzip"
+_AwaitedValueT = TypeVar("_AwaitedValueT")
+_HttpResultT = TypeVar("_HttpResultT")
 
 
 @dataclass(frozen=True)
@@ -139,6 +143,126 @@ class _SecThrottleState:
 
     next_request_at: float = 0.0
     cooldown_until: float = 0.0
+
+
+def _build_empty_content_failure_event(
+    descriptor: RemoteFileDescriptor,
+    http_status: Optional[int],
+) -> DownloaderEvent:
+    """构造 0 字节下载失败事件。
+
+    Args:
+        descriptor: 当前远端文件描述。
+        http_status: 本次下载对应的 HTTP 状态码。
+
+    Returns:
+        `empty_content` 类型的失败事件。
+
+    Raises:
+        无。
+    """
+
+    return DownloaderEvent(
+        event_type="file_failed",
+        name=descriptor.name,
+        source_url=descriptor.source_url,
+        http_etag=descriptor.http_etag,
+        http_last_modified=descriptor.http_last_modified,
+        http_status=http_status,
+        reason_code="empty_content",
+        reason_message="下载内容为 0 字节，视为下载失败",
+        error="下载内容为 0 字节，视为下载失败",
+    )
+
+
+def _should_abort_after_empty_primary(
+    descriptor_name: str,
+    primary_document: Optional[str],
+) -> bool:
+    """判断 0 字节文件是否应中止整个 filing 下载。
+
+    Args:
+        descriptor_name: 当前文件名。
+        primary_document: 调用方指定的主文档文件名。
+
+    Returns:
+        若当前文件就是主文档且返回 0 字节，则返回 `True`。
+
+    Raises:
+        无。
+    """
+
+    return bool(primary_document) and descriptor_name == primary_document
+
+
+def _handle_conditional_download_response(response: httpx.Response) -> tuple[int, Optional[bytes]]:
+    """处理条件下载响应。
+
+    Args:
+        response: HTTP 响应对象。
+
+    Returns:
+        `(status_code, payload)`；若命中 `304`，则 payload 为 `None`。
+
+    Raises:
+        httpx.HTTPError: 非成功状态且非 `304` 时抛出。
+    """
+
+    if response.status_code == 304:
+        return 304, None
+    response.raise_for_status()
+    return response.status_code, response.content
+
+
+def _parse_http_json_response(response: httpx.Response) -> dict[str, Any]:
+    """解析 JSON 响应体。
+
+    Args:
+        response: HTTP 响应对象。
+
+    Returns:
+        JSON 字典。
+
+    Raises:
+        httpx.HTTPError: HTTP 状态异常时抛出。
+        ValueError: JSON 解析失败时抛出。
+    """
+
+    response.raise_for_status()
+    return cast(dict[str, Any], response.json())
+
+
+def _read_http_binary_response(response: httpx.Response) -> bytes:
+    """读取字节响应体。
+
+    Args:
+        response: HTTP 响应对象。
+
+    Returns:
+        响应体字节。
+
+    Raises:
+        httpx.HTTPError: HTTP 状态异常时抛出。
+    """
+
+    response.raise_for_status()
+    return response.content
+
+
+def _return_http_response(response: httpx.Response) -> httpx.Response:
+    """原样返回 HTTP 响应。
+
+    Args:
+        response: HTTP 响应对象。
+
+    Returns:
+        原始响应对象。
+
+    Raises:
+        无。
+    """
+
+    return response
 
 
 class _RelativeHtmlLinkExtractor(HTMLParser):
@@ -504,28 +628,6 @@ def hash_file_sha256(file_path: Path) -> str:
             sha256.update(chunk)
     return sha256.hexdigest()
 
-
-def _safe_int(raw_value: Optional[str]) -> Optional[int]:
-    """安全转整数。
-
-    Args:
-        raw_value: 原始字符串。
-
-    Returns:
-        转换后的整数或 `None`。
-
-    Raises:
-        无。
-    """
-
-    if raw_value is None:
-        return None
-    stripped = str(raw_value).strip()
-    if not stripped:
-        return None
-    if not stripped.isdigit():
-        return None
-    return int(stripped)
 
 
 def _load_sec_throttle_state(state_path: Path) -> _SecThrottleState:
@@ -1043,10 +1145,10 @@ class SecDownloader:
                     source_url=source_url,
                     http_etag=_safe_header(head_response, "ETag"),
                     http_last_modified=_safe_header(head_response, "Last-Modified"),
-                    remote_size=_safe_int(_safe_header(head_response, "Content-Length")),
+                    remote_size=optional_int(_safe_header(head_response, "Content-Length")),
                     http_status=head_response.status_code if head_response else None,
                     sec_document_type=_normalize_sec_document_type(metadata.get("type")),
-                    sec_description=_normalize_optional_text(metadata.get("description")),
+                    sec_description=normalize_optional_text(metadata.get("description")),
                 )
             )
         return descriptors
@@ -1132,20 +1234,9 @@ class SecDownloader:
                     )
                     continue
                 if len(payload) == 0:
-                    # 服务器返回 0 字节内容（如 SNOW/FUTU 某些 filing），不落盘，视为失败
-                    yield DownloaderEvent(
-                        event_type="file_failed",
-                        name=descriptor.name,
-                        source_url=descriptor.source_url,
-                        http_etag=descriptor.http_etag,
-                        http_last_modified=descriptor.http_last_modified,
-                        http_status=status_code,
-                        reason_code="empty_content",
-                        reason_message="下载内容为 0 字节，视为下载失败",
-                        error="下载内容为 0 字节，视为下载失败",
-                    )
-                    if primary_document and descriptor.name == primary_document:
-                        # 主文档 0 字节：整个 filing 无效，中止下载，确保后续文件不落盘
+                    yield _build_empty_content_failure_event(descriptor, status_code)
+                    if _should_abort_after_empty_primary(descriptor.name, primary_document):
+                        # 主文档 0 字节：整个 filing 无效，中止下载，确保后续文件不落盘。
                         return
                     continue
                 file_meta = store_file(descriptor.name, _to_binary_stream(payload))
@@ -1162,20 +1253,9 @@ class SecDownloader:
             try:
                 payload = await _await_if_needed(self._http_download(descriptor.source_url))
                 if len(payload) == 0:
-                    # 服务器返回 0 字节内容（如 SNOW/FUTU 某些 filing），不落盘，视为失败
-                    yield DownloaderEvent(
-                        event_type="file_failed",
-                        name=descriptor.name,
-                        source_url=descriptor.source_url,
-                        http_etag=descriptor.http_etag,
-                        http_last_modified=descriptor.http_last_modified,
-                        http_status=descriptor.http_status,
-                        reason_code="empty_content",
-                        reason_message="下载内容为 0 字节，视为下载失败",
-                        error="下载内容为 0 字节，视为下载失败",
-                    )
-                    if primary_document and descriptor.name == primary_document:
-                        # 主文档 0 字节：整个 filing 无效，中止下载，确保后续文件不落盘
+                    yield _build_empty_content_failure_event(descriptor, descriptor.http_status)
+                    if _should_abort_after_empty_primary(descriptor.name, primary_document):
+                        # 主文档 0 字节：整个 filing 无效，中止下载，确保后续文件不落盘。
                         return
                     continue
                 file_meta = store_file(descriptor.name, _to_binary_stream(payload))
@@ -1274,6 +1354,80 @@ class SecDownloader:
                 )
         return results
 
+    async def _execute_sec_request(
+        self,
+        *,
+        url: str,
+        method: Literal["GET", "HEAD"],
+        response_handler: Callable[[httpx.Response], _HttpResultT],
+        handled_exceptions: tuple[type[Exception], ...],
+        attempt_log_prefix: str,
+        failure_prefix: str,
+        extra_headers: Optional[dict[str, str]] = None,
+        allow_redirects: bool = False,
+    ) -> _HttpResultT:
+        """执行带 SEC 限流与重试策略的 HTTP 请求。
+
+        Args:
+            url: 请求地址。
+            method: HTTP 方法。
+            response_handler: 成功响应处理器，可在其中执行 `raise_for_status()` 或解析响应体。
+            handled_exceptions: 需要触发重试的异常类型集合。
+            attempt_log_prefix: 单次失败时的日志前缀。
+            failure_prefix: 重试耗尽后的异常前缀。
+            extra_headers: 额外请求头。
+            allow_redirects: `HEAD` 请求是否跟随重定向。
+
+        Returns:
+            `response_handler` 产出的结果。
+
+        Raises:
+            RuntimeError: 重试耗尽后抛出。
+        """
+
+        headers = self._build_headers()
+        if extra_headers:
+            headers.update(extra_headers)
+        last_exception: Optional[Exception] = None
+        throttle_retries_remaining = _SEC_THROTTLE_MAX_RETRIES
+        attempt_index = 0
+        while attempt_index < self._max_retries:
+            await self._rate_limit()
+            try:
+                if method == "GET":
+                    response = await self._client.get(
+                        url=url,
+                        headers=headers,
+                        timeout=self._request_timeout_seconds,
+                    )
+                else:
+                    response = await self._client.head(
+                        url=url,
+                        headers=headers,
+                        timeout=self._request_timeout_seconds,
+                        follow_redirects=allow_redirects,
+                    )
+                if response.status_code in _THROTTLE_STATUS_CODES and throttle_retries_remaining > 0:
+                    throttle_retries_remaining -= 1
+                    delay = _resolve_sec_throttle_delay(response)
+                    self._register_global_throttle_cooldown(delay)
+                    Log.warn(
+                        f"SEC 限流 {response.status_code}: url={url} 等待 {delay:.1f}s",
+                        module=self.MODULE,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                return response_handler(response)
+            except handled_exceptions as exc:
+                last_exception = exc
+                Log.debug(
+                    f"{attempt_log_prefix}: url={url} attempt={attempt_index + 1} error={exc}",
+                    module=self.MODULE,
+                )
+                await self._retry_backoff(attempt_index)
+                attempt_index += 1
+        raise RuntimeError(f"{failure_prefix}: url={url} error={last_exception}")
+
     async def _http_download_if_modified(
         self,
         url: str,
@@ -1301,46 +1455,16 @@ class SecDownloader:
             conditional_headers["If-Modified-Since"] = last_modified
         if not conditional_headers:
             return 200, await self._http_download(url=url)
-        headers = self._build_headers()
-        headers.update(conditional_headers)
-        last_exception: Optional[Exception] = None
-        throttle_retries_remaining = _SEC_THROTTLE_MAX_RETRIES
-        attempt_index = 0
-        while attempt_index < self._max_retries:
-            await self._rate_limit()
-            try:
-                response = await self._client.get(
-                    url=url,
-                    headers=headers,
-                    timeout=self._request_timeout_seconds,
-                )
-                if response.status_code == 304:
-                    return 304, None
-                # 503/429 限流 → 额外退避，不消耗正常重试次数
-                if response.status_code in _THROTTLE_STATUS_CODES and throttle_retries_remaining > 0:
-                    throttle_retries_remaining -= 1
-                    delay = _resolve_sec_throttle_delay(response)
-                    self._register_global_throttle_cooldown(delay)
-                    Log.warn(
-                        f"SEC 限流 {response.status_code}: url={url} 等待 {delay:.1f}s",
-                        module=self.MODULE,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                response.raise_for_status()
-                return response.status_code, response.content
-            except httpx.HTTPError as exc:
-                last_exception = exc
-                Log.debug(
-                    (
-                        "条件下载失败: "
-                        f"url={url} attempt={attempt_index + 1} error={exc}"
-                    ),
-                    module=self.MODULE,
-                )
-                await self._retry_backoff(attempt_index)
-                attempt_index += 1
-        raise RuntimeError(f"条件下载失败: url={url} error={last_exception}")
+
+        return await self._execute_sec_request(
+            url=url,
+            method="GET",
+            response_handler=_handle_conditional_download_response,
+            handled_exceptions=(httpx.HTTPError,),
+            attempt_log_prefix="条件下载失败",
+            failure_prefix="条件下载失败",
+            extra_headers=conditional_headers,
+        )
 
     async def _http_get_json(self, url: str) -> dict[str, Any]:
         """执行 GET JSON 请求。
@@ -1355,40 +1479,14 @@ class SecDownloader:
             RuntimeError: 请求失败时抛出。
         """
 
-        headers = self._build_headers()
-        last_exception: Optional[Exception] = None
-        throttle_retries_remaining = _SEC_THROTTLE_MAX_RETRIES
-        attempt_index = 0
-        while attempt_index < self._max_retries:
-            await self._rate_limit()
-            try:
-                response = await self._client.get(
-                    url=url,
-                    headers=headers,
-                    timeout=self._request_timeout_seconds,
-                )
-                # 503/429 限流 → 额外退避，不消耗正常重试次数
-                if response.status_code in _THROTTLE_STATUS_CODES and throttle_retries_remaining > 0:
-                    throttle_retries_remaining -= 1
-                    delay = _resolve_sec_throttle_delay(response)
-                    self._register_global_throttle_cooldown(delay)
-                    Log.warn(
-                        f"SEC 限流 {response.status_code}: url={url} 等待 {delay:.1f}s",
-                        module=self.MODULE,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                response.raise_for_status()
-                return response.json()
-            except (httpx.HTTPError, ValueError) as exc:
-                last_exception = exc
-                Log.debug(
-                    f"GET JSON 失败: url={url} attempt={attempt_index + 1} error={exc}",
-                    module=self.MODULE,
-                )
-                await self._retry_backoff(attempt_index)
-                attempt_index += 1
-        raise RuntimeError(f"GET JSON 失败: url={url} error={last_exception}")
+        return await self._execute_sec_request(
+            url=url,
+            method="GET",
+            response_handler=_parse_http_json_response,
+            handled_exceptions=(httpx.HTTPError, ValueError),
+            attempt_log_prefix="GET JSON 失败",
+            failure_prefix="GET JSON 失败",
+        )
 
     async def _http_head(self, url: str, allow_redirects: bool) -> Optional[httpx.Response]:
         """执行 HEAD 请求。
@@ -1404,38 +1502,18 @@ class SecDownloader:
             无。
         """
 
-        headers = self._build_headers()
-        throttle_retries_remaining = _SEC_THROTTLE_MAX_RETRIES
-        attempt_index = 0
-        while attempt_index < self._max_retries:
-            await self._rate_limit()
-            try:
-                response = await self._client.head(
-                    url=url,
-                    headers=headers,
-                    timeout=self._request_timeout_seconds,
-                    follow_redirects=allow_redirects,
-                )
-                # 503/429 限流 → 额外退避，不消耗正常重试次数
-                if response.status_code in _THROTTLE_STATUS_CODES and throttle_retries_remaining > 0:
-                    throttle_retries_remaining -= 1
-                    delay = _resolve_sec_throttle_delay(response)
-                    self._register_global_throttle_cooldown(delay)
-                    Log.warn(
-                        f"SEC 限流 {response.status_code}: url={url} 等待 {delay:.1f}s",
-                        module=self.MODULE,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                return response
-            except httpx.HTTPError as exc:
-                Log.debug(
-                    f"HEAD 失败: url={url} attempt={attempt_index + 1} error={exc}",
-                    module=self.MODULE,
-                )
-                await self._retry_backoff(attempt_index)
-                attempt_index += 1
-        return None
+        try:
+            return await self._execute_sec_request(
+                url=url,
+                method="HEAD",
+                response_handler=_return_http_response,
+                handled_exceptions=(httpx.HTTPError,),
+                attempt_log_prefix="HEAD 失败",
+                failure_prefix="HEAD 失败",
+                allow_redirects=allow_redirects,
+            )
+        except RuntimeError:
+            return None
 
     async def _http_download(self, url: str) -> bytes:
         """下载文件并返回内容。
@@ -1450,43 +1528,14 @@ class SecDownloader:
             RuntimeError: 下载失败时抛出。
         """
 
-        headers = self._build_headers()
-        last_exception: Optional[Exception] = None
-        throttle_retries_remaining = _SEC_THROTTLE_MAX_RETRIES
-        attempt_index = 0
-        while attempt_index < self._max_retries:
-            await self._rate_limit()
-            try:
-                response = await self._client.get(
-                    url=url,
-                    headers=headers,
-                    timeout=self._request_timeout_seconds,
-                )
-                # 503/429 限流 → 额外退避，不消耗正常重试次数
-                if response.status_code in _THROTTLE_STATUS_CODES and throttle_retries_remaining > 0:
-                    throttle_retries_remaining -= 1
-                    delay = _resolve_sec_throttle_delay(response)
-                    self._register_global_throttle_cooldown(delay)
-                    Log.warn(
-                        f"SEC 限流 {response.status_code}: url={url} 等待 {delay:.1f}s",
-                        module=self.MODULE,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                response.raise_for_status()
-                return response.content
-            except httpx.HTTPError as exc:
-                last_exception = exc
-                Log.debug(
-                    (
-                        "下载失败: "
-                        f"url={url} attempt={attempt_index + 1} error={exc}"
-                    ),
-                    module=self.MODULE,
-                )
-                await self._retry_backoff(attempt_index)
-                attempt_index += 1
-        raise RuntimeError(f"下载失败: url={url} error={last_exception}")
+        return await self._execute_sec_request(
+            url=url,
+            method="GET",
+            response_handler=_read_http_binary_response,
+            handled_exceptions=(httpx.HTTPError,),
+            attempt_log_prefix="下载失败",
+            failure_prefix="下载失败",
+        )
 
     async def _http_get_bytes(self, url: str) -> bytes:
         """执行 GET 请求并返回字节内容。
@@ -1501,40 +1550,14 @@ class SecDownloader:
             RuntimeError: 请求失败时抛出。
         """
 
-        headers = self._build_headers()
-        last_exception: Optional[Exception] = None
-        throttle_retries_remaining = _SEC_THROTTLE_MAX_RETRIES
-        attempt_index = 0
-        while attempt_index < self._max_retries:
-            await self._rate_limit()
-            try:
-                response = await self._client.get(
-                    url=url,
-                    headers=headers,
-                    timeout=self._request_timeout_seconds,
-                )
-                # 503/429 限流 → 额外退避，不消耗正常重试次数
-                if response.status_code in _THROTTLE_STATUS_CODES and throttle_retries_remaining > 0:
-                    throttle_retries_remaining -= 1
-                    delay = _resolve_sec_throttle_delay(response)
-                    self._register_global_throttle_cooldown(delay)
-                    Log.warn(
-                        f"SEC 限流 {response.status_code}: url={url} 等待 {delay:.1f}s",
-                        module=self.MODULE,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                response.raise_for_status()
-                return response.content
-            except httpx.HTTPError as exc:
-                last_exception = exc
-                Log.debug(
-                    f"GET bytes 失败: url={url} attempt={attempt_index + 1} error={exc}",
-                    module=self.MODULE,
-                )
-                await self._retry_backoff(attempt_index)
-                attempt_index += 1
-        raise RuntimeError(f"GET bytes 失败: url={url} error={last_exception}")
+        return await self._execute_sec_request(
+            url=url,
+            method="GET",
+            response_handler=_read_http_binary_response,
+            handled_exceptions=(httpx.HTTPError,),
+            attempt_log_prefix="GET bytes 失败",
+            failure_prefix="GET bytes 失败",
+        )
 
     async def _try_fetch_index_items(self, cik: str, accession_no_dash: str) -> list[dict[str, Any]]:
         """尝试拉取 index.json 中的 item 列表。
@@ -1630,6 +1653,8 @@ class SecDownloader:
     def _resolve_user_agent(self, configured_user_agent: Optional[str]) -> str:
         """解析 User-Agent。
 
+        优先级：显式传入 > 环境变量 SEC_USER_AGENT > 未配置 fallback（附警告）。
+
         Args:
             configured_user_agent: 显式传入的 User-Agent。
 
@@ -1640,8 +1665,15 @@ class SecDownloader:
             无。
         """
 
-        value = (configured_user_agent or os.environ.get(SEC_USER_AGENT_ENV) or DEFAULT_USER_AGENT).strip()
-        return value or DEFAULT_USER_AGENT
+        value = (configured_user_agent or os.environ.get(SEC_USER_AGENT_ENV) or "").strip()
+        if value:
+            return value
+        Log.warning(
+            f"SEC User-Agent 未配置。SEC 要求提供真实联系信息，否则可能限流或封禁。"
+            f"请通过环境变量 {SEC_USER_AGENT_ENV} 或 dayu-cli init 配置。",
+            module=self.MODULE,
+        )
+        return _UNCONFIGURED_USER_AGENT
 
     def _build_headers(self) -> dict[str, str]:
         """构建请求头。
@@ -1802,29 +1834,6 @@ def _safe_header(response: Optional[httpx.Response], key: str) -> Optional[str]:
     return response.headers.get(key)
 
 
-def _read_response_bytes(response: Any) -> bytes:
-    """读取响应体为 bytes。
-
-    Args:
-        response: Response 对象。
-
-    Returns:
-        响应体字节。
-
-    Raises:
-        RuntimeError: 读取响应体失败时抛出。
-    """
-
-    try:
-        chunks: list[bytes] = []
-        for chunk in response.iter_content(chunk_size=1024 * 64):
-            if chunk:
-                chunks.append(chunk)
-        return b"".join(chunks)
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("读取响应体失败") from exc
-
-
 def _to_binary_stream(payload: bytes) -> BinaryIO:
     """将 bytes 包装为可读二进制流。
 
@@ -1841,7 +1850,17 @@ def _to_binary_stream(payload: bytes) -> BinaryIO:
     return BytesIO(payload)
 
 
-async def _await_if_needed(value: Any) -> Any:
+@overload
+async def _await_if_needed(value: Awaitable[_AwaitedValueT]) -> _AwaitedValueT:
+    """按需等待可等待对象（awaitable 重载）。"""
+
+
+@overload
+async def _await_if_needed(value: _AwaitedValueT) -> _AwaitedValueT:
+    """按需等待可等待对象（普通值重载）。"""
+
+
+async def _await_if_needed(value: Awaitable[_AwaitedValueT] | _AwaitedValueT) -> _AwaitedValueT:
     """按需等待可等待对象。
 
     Args:
@@ -1854,9 +1873,9 @@ async def _await_if_needed(value: Any) -> Any:
         RuntimeError: 可等待对象执行失败时抛出。
     """
 
-    if hasattr(value, "__await__"):
-        return await value
-    return value
+    if inspect.isawaitable(value):
+        return await cast(Awaitable[_AwaitedValueT], value)
+    return cast(_AwaitedValueT, value)
 
 
 def _parse_sc13_party_roles_from_index_headers(payload: bytes) -> Optional[Sc13PartyRoles]:
@@ -1981,23 +2000,6 @@ def _extract_sc13_section_text(
     return None
 
 
-def _normalize_optional_text(value: Any) -> Optional[str]:
-    """规范化可选文本字段。
-
-    Args:
-        value: 原始值。
-
-    Returns:
-        去空白后的字符串；空值返回 `None`。
-
-    Raises:
-        无。
-    """
-
-    normalized = str(value or "").strip()
-    return normalized or None
-
-
 def _normalize_sec_document_type(value: Any) -> Optional[str]:
     """规范化 SEC 文档类型。
 
@@ -2013,7 +2015,7 @@ def _normalize_sec_document_type(value: Any) -> Optional[str]:
         无。
     """
 
-    normalized = _normalize_optional_text(value)
+    normalized = normalize_optional_text(value)
     if normalized is None:
         return None
     upper = normalized.upper()
@@ -2047,14 +2049,14 @@ def _build_file_metadata_map(
     for item in [*index_items, *index_header_documents]:
         if not isinstance(item, dict):
             continue
-        name = _normalize_optional_text(item.get("name"))
+        name = normalize_optional_text(item.get("name"))
         if name is None:
             continue
         target = mapping.setdefault(name, {})
         document_type = _normalize_sec_document_type(item.get("type"))
         if document_type is not None:
             target["type"] = document_type
-        description = _normalize_optional_text(item.get("description"))
+        description = normalize_optional_text(item.get("description"))
         if description is not None:
             target["description"] = description
     return mapping

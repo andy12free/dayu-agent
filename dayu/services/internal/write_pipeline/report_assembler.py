@@ -6,11 +6,10 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from dayu.services.internal.write_pipeline.audit_formatting import _strip_evidence_section
-from dayu.services.internal.write_pipeline.models import ChapterResult, WriteRunConfig
-from dayu.services.internal.write_pipeline.template_parser import build_report_markdown
+from dayu.services.contracts import WriteRunConfig
+from dayu.services.internal.write_pipeline.models import ChapterResult
+from dayu.services.internal.write_pipeline.template_parser import TemplateLayout, build_report_markdown
 
 _OVERVIEW_CHAPTER_TITLE = "投资要点概览"
 _SOURCE_CHAPTER_TITLE = "来源清单"
@@ -36,7 +35,7 @@ class ReportAssembler:
 
     def assemble_report(
         self,
-        layout: Any,
+        layout: TemplateLayout,
         chapter_results: dict[str, ChapterResult],
         source_chapter_markdown: str | None,
         *,

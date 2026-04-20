@@ -104,7 +104,7 @@ from dataclasses import dataclass
 
 from dayu.contracts.agent_types import AgentMessage
 from dayu.contracts.protocols import ToolExecutionContext
-from dayu.engine.cancellation import CancelledError as EngineCancelledError, CancellationToken
+from dayu.contracts.cancellation import CancelledError as EngineCancelledError, CancellationToken
 
 # 可选依赖，导入失败不立即报错
 aiohttp: ModuleType | None
@@ -1232,7 +1232,7 @@ class AsyncOpenAIRunner:
         # 2) 获取解析结果
         result = parser.get_result()
         full_content = result.content
-        raw_tool_call_count = len(parser._tool_calls_buffer)
+        raw_tool_call_count = result.raw_tool_call_count
 
         if result.protocol_errors:
             error_item = result.protocol_errors[0]

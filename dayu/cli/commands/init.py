@@ -2,7 +2,7 @@
 
 模块职责：
 - 复制包内配置到工作区
-- 交互式选择模型供应商 → 配置 API Key → 更新 manifest 默认模型
+- 交互式选择初始化模型方案 → 配置 API Key → 更新 manifest 默认模型
 - 可选配置联网检索 API Key
 - 跨平台环境变量持久化（macOS/Linux shell profile，Windows setx）
 """
@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 import os
 import platform
 import re
@@ -17,10 +18,17 @@ import shutil
 import subprocess
 import sys
 from argparse import Namespace
+from dataclasses import dataclass
 from pathlib import Path
 import urllib.request
 import urllib.error
-from dayu.startup.config_file_resolver import _resolve_package_config_path
+from dayu.startup.config_file_resolver import resolve_package_assets_path, resolve_package_config_path
+from dayu.contracts.env_keys import (
+    FMP_API_KEY_ENV,
+    SEC_USER_AGENT_ENV,
+    SERPER_API_KEY_ENV,
+    TAVILY_API_KEY_ENV,
+)
 
 MODULE = "CLI.INIT"
 
@@ -28,31 +36,100 @@ MODULE = "CLI.INIT"
 #  供应商定义
 # --------------------------------------------------------------------------- #
 
-_PROVIDER_DISPLAY_NAMES: dict[str, str] = {
-    "MIMO_PLAN_API_KEY": "Mimo Token Plan",
-    "MIMO_API_KEY": "Mimo",
-    "DEEPSEEK_API_KEY": "DeepSeek",
-    "OPENAI_API_KEY": "OpenAI",
-    "ANTHROPIC_API_KEY": "Anthropic",
-    "GEMINI_API_KEY": "Google Gemini",
-    "QWEN_API_KEY": "阿里通义千问",
-}
+@dataclass(frozen=True)
+class _ProviderOption:
+    """`dayu-cli init` 中的单个初始化模型方案定义。"""
 
-_PROVIDER_MODEL_MAP: dict[str, tuple[str, str]] = {
-    "MIMO_PLAN_API_KEY": ("mimo-v2-pro-plan", "mimo-v2-pro-thinking-plan"),
-    "MIMO_API_KEY": ("mimo-v2-pro", "mimo-v2-pro-thinking"),
-    "DEEPSEEK_API_KEY": ("deepseek-chat", "deepseek-thinking"),
-    "OPENAI_API_KEY": ("gpt-5.4", "gpt-5.4"),
-    "ANTHROPIC_API_KEY": ("claude-sonnet-4-6", "claude-sonnet-4-6"),
-    "GEMINI_API_KEY": ("gemini-2.5-flash", "gemini-2.5-flash"),
-    "QWEN_API_KEY": ("qwen3", "qwen3-thinking"),
-}
+    option_key: str
+    display_name: str
+    api_key_name: str
+    non_thinking_model: str
+    thinking_model: str
 
-# 从 _PROVIDER_MODEL_MAP 推导：所有可能出现在 manifest default_name 中的 non-thinking 模型名集合
-_ALL_NON_THINKING_MODELS: frozenset[str] = frozenset(m[0] for m in _PROVIDER_MODEL_MAP.values())
+
+_PROVIDER_OPTION_MIMO_PLAN = "mimo_plan"
+_PROVIDER_OPTION_MIMO_PLAN_SG = "mimo_plan_sg"
+_PROVIDER_OPTION_MIMO_PRO = "mimo_pro"
+_PROVIDER_OPTION_MIMO_FLASH = "mimo_flash"
+_PROVIDER_OPTION_DEEPSEEK = "deepseek"
+_PROVIDER_OPTION_OPENAI = "openai"
+_PROVIDER_OPTION_ANTHROPIC = "anthropic"
+_PROVIDER_OPTION_GEMINI = "gemini"
+_PROVIDER_OPTION_QWEN = "qwen"
+
+_PROVIDER_OPTIONS: tuple[_ProviderOption, ...] = (
+    _ProviderOption(
+        option_key=_PROVIDER_OPTION_MIMO_PLAN,
+        display_name="Mimo Token Plan",
+        api_key_name="MIMO_PLAN_API_KEY",
+        non_thinking_model="mimo-v2-pro-plan",
+        thinking_model="mimo-v2-pro-thinking-plan",
+    ),
+    _ProviderOption(
+        option_key=_PROVIDER_OPTION_MIMO_PLAN_SG,
+        display_name="Mimo Token Plan (海外)",
+        api_key_name="MIMO_PLAN_SG_API_KEY",
+        non_thinking_model="mimo-v2-pro-plan-sg",
+        thinking_model="mimo-v2-pro-thinking-plan-sg",
+    ),
+    _ProviderOption(
+        option_key=_PROVIDER_OPTION_MIMO_PRO,
+        display_name="Mimo Pro（常规 API）",
+        api_key_name="MIMO_API_KEY",
+        non_thinking_model="mimo-v2-pro",
+        thinking_model="mimo-v2-pro-thinking",
+    ),
+    _ProviderOption(
+        option_key=_PROVIDER_OPTION_MIMO_FLASH,
+        display_name="Mimo Flash（常规 API）",
+        api_key_name="MIMO_API_KEY",
+        non_thinking_model="mimo-v2-flash",
+        thinking_model="mimo-v2-flash-thinking",
+    ),
+    _ProviderOption(
+        option_key=_PROVIDER_OPTION_DEEPSEEK,
+        display_name="DeepSeek",
+        api_key_name="DEEPSEEK_API_KEY",
+        non_thinking_model="deepseek-chat",
+        thinking_model="deepseek-thinking",
+    ),
+    _ProviderOption(
+        option_key=_PROVIDER_OPTION_OPENAI,
+        display_name="OpenAI",
+        api_key_name="OPENAI_API_KEY",
+        non_thinking_model="gpt-5.4",
+        thinking_model="gpt-5.4",
+    ),
+    _ProviderOption(
+        option_key=_PROVIDER_OPTION_ANTHROPIC,
+        display_name="Anthropic",
+        api_key_name="ANTHROPIC_API_KEY",
+        non_thinking_model="claude-sonnet-4-6",
+        thinking_model="claude-sonnet-4-6",
+    ),
+    _ProviderOption(
+        option_key=_PROVIDER_OPTION_GEMINI,
+        display_name="Google Gemini",
+        api_key_name="GEMINI_API_KEY",
+        non_thinking_model="gemini-2.5-flash",
+        thinking_model="gemini-2.5-flash",
+    ),
+    _ProviderOption(
+        option_key=_PROVIDER_OPTION_QWEN,
+        display_name="阿里通义千问",
+        api_key_name="QWEN_API_KEY",
+        non_thinking_model="qwen3",
+        thinking_model="qwen3-thinking",
+    ),
+)
+
+_PROVIDER_OPTIONS_BY_KEY: dict[str, _ProviderOption] = {option.option_key: option for option in _PROVIDER_OPTIONS}
+
+# 从初始化方案推导：所有可能出现在 manifest default_name 中的 non-thinking 模型名集合
+_ALL_NON_THINKING_MODELS: frozenset[str] = frozenset(option.non_thinking_model for option in _PROVIDER_OPTIONS)
 
 # 所有可能出现的 thinking 模型名集合
-_ALL_THINKING_MODELS: frozenset[str] = frozenset(m[1] for m in _PROVIDER_MODEL_MAP.values())
+_ALL_THINKING_MODELS: frozenset[str] = frozenset(option.thinking_model for option in _PROVIDER_OPTIONS)
 
 # 仅出现在 non-thinking 集合而不在 thinking 集合中的模型名
 _ONLY_NON_THINKING: frozenset[str] = _ALL_NON_THINKING_MODELS - _ALL_THINKING_MODELS
@@ -67,15 +144,23 @@ _ROLE_NON_THINKING = "non_thinking"
 _ROLE_THINKING = "thinking"
 
 _OPTIONAL_SEARCH_KEYS: list[str] = [
-    "TAVILY_API_KEY",
-    "SERPER_API_KEY",
-    "FMP_API_KEY",
+    TAVILY_API_KEY_ENV,
+    SERPER_API_KEY_ENV,
+    FMP_API_KEY_ENV,
 ]
 
 _HF_MIRROR_URL = "https://hf-mirror.com"
 
 _HF_PROBE_URL = "https://huggingface.co"
 _HF_PROBE_TIMEOUT_SECONDS = 5
+
+_PREWARM_MODULES: tuple[str, ...] = (
+    "dayu.cli.dependency_setup",
+    "dayu.cli.interactive_ui",
+    "dayu.cli.commands.interactive",
+    "dayu.cli.commands.prompt",
+    "dayu.cli.commands.write",
+)
 
 # --------------------------------------------------------------------------- #
 #  环境变量持久化
@@ -85,26 +170,41 @@ _HF_PROBE_TIMEOUT_SECONDS = 5
 def _detect_shell_profile() -> tuple[Path, bool]:
     """检测当前用户的 shell profile 路径。
 
+    优先依据 ``SHELL`` 推断 profile 类型；若 ``SHELL`` 缺失，则回退到
+    当前 ``HOME`` 下已有的 profile 文件。只有在明确识别为 ``fish`` / ``nu``
+    这类不兼容 ``export KEY=value`` 语法的 shell 时，才返回不兼容标记。
+
     Returns:
         ``(profile_path, is_export_compatible)`` 元组。
-        ``is_export_compatible`` 为 ``True`` 表示该 shell 使用 ``export KEY=value`` 语法（bash/zsh）。
-        为 ``False`` 表示该 shell（如 fish）不兼容 ``export`` 语法，
-        仍返回 ``~/.profile`` 但调用方需要警告用户手动配置。
+        ``is_export_compatible`` 为 ``True`` 表示可以安全写入
+        ``export KEY=value`` 形式的 profile 文件。
+        为 ``False`` 表示 shell 明确不兼容该语法，调用方应提示用户手动配置。
 
     Raises:
         无。
     """
 
-    shell = os.environ.get("SHELL", "")
+    shell = os.environ.get("SHELL", "").lower()
     home = Path.home()
+    zshrc = home / ".zshrc"
+    bashrc = home / ".bashrc"
+    bash_profile = home / ".bash_profile"
+    profile = home / ".profile"
+
     if "zsh" in shell:
-        return home / ".zshrc", True
+        return zshrc, True
     if "bash" in shell:
-        bashrc = home / ".bashrc"
-        bash_profile = home / ".bash_profile"
         return (bash_profile if bash_profile.exists() else bashrc), True
-    # fish、nu 等 shell 不兼容 export 语法
-    return home / ".profile", False
+    if "fish" in shell or "nushell" in shell or shell.endswith("/nu"):
+        return profile, False
+
+    if zshrc.exists():
+        return zshrc, True
+    if bash_profile.exists():
+        return bash_profile, True
+    if bashrc.exists():
+        return bashrc, True
+    return profile, True
 
 
 def _write_env_to_shell_profile(key: str, value: str, profile: Path) -> bool:
@@ -198,7 +298,10 @@ def _persist_env_var(key: str, value: str) -> tuple[str, bool]:
     if not is_compatible:
         return str(profile), False
 
-    _write_env_to_shell_profile(key, value, profile)
+    try:
+        _write_env_to_shell_profile(key, value, profile)
+    except OSError:
+        return str(profile), False
     return str(profile), True
 
 
@@ -221,7 +324,7 @@ def _copy_config(base_dir: Path, *, overwrite: bool) -> Path:
         无。
     """
 
-    src = _resolve_package_config_path()
+    src = resolve_package_config_path()
     dst = (base_dir / "config").resolve()
 
     if dst.exists() and not overwrite:
@@ -233,6 +336,86 @@ def _copy_config(base_dir: Path, *, overwrite: bool) -> Path:
 
     shutil.copytree(src, dst)
     return dst
+
+
+def _copy_assets(base_dir: Path, *, overwrite: bool) -> Path:
+    """复制包内 assets 到工作区。
+
+    Args:
+        base_dir: 工作区根目录。
+        overwrite: 是否覆盖已有文件。
+
+    Returns:
+        目标 assets 目录路径。
+
+    Raises:
+        无。
+    """
+
+    src = resolve_package_assets_path()
+    dst = (base_dir / "assets").resolve()
+
+    if dst.exists() and not overwrite:
+        print(f"assets 目录已存在: {dst}（使用 --overwrite 覆盖）")
+        return dst
+
+    if dst.exists() and overwrite:
+        shutil.rmtree(dst)
+
+    shutil.copytree(src, dst)
+    return dst
+
+
+def _should_run_init_prewarm(
+    *,
+    is_first_workspace_init: bool,
+    overwrite: bool,
+    main_key_persist_failed: bool,
+) -> bool:
+    """判断当前 `init` 是否应执行首次安装 prewarm。
+
+    Args:
+        is_first_workspace_init: 当前是否属于首次初始化。
+        overwrite: 是否显式覆盖初始化。
+        main_key_persist_failed: 主 API Key 是否持久化失败。
+
+    Returns:
+        若属于首次初始化且主 Key 可用，则返回 `True`；否则返回 `False`。
+
+    Raises:
+        无。
+    """
+
+    if overwrite or main_key_persist_failed:
+        return False
+    return is_first_workspace_init
+
+
+def _run_init_prewarm(*, base_dir: Path, config_dir: Path) -> tuple[bool, str]:
+    """执行 `dayu-cli init` 的首次安装 runtime prewarm。
+
+    该预热只做无副作用的运行时装配，不执行 prompt / interactive / write
+    的真实业务逻辑，用于把首次冷启动成本前移到安装阶段。
+
+    Args:
+        base_dir: 工作区根目录。
+        config_dir: 已复制完成的配置目录。
+
+    Returns:
+        `(success, message)`。成功时 `message` 为空字符串；失败时返回可直接展示给用户的错误摘要。
+
+    Raises:
+        无。所有异常都会被内部捕获并转成失败结果。
+    """
+
+    del base_dir
+    del config_dir
+    try:
+        for module_name in _PREWARM_MODULES:
+            importlib.import_module(module_name)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, ""
 
 
 # --------------------------------------------------------------------------- #
@@ -285,7 +468,7 @@ def _resolve_role_from_package_manifest(manifest_filename: str) -> str | None:
         无。
     """
 
-    pkg_manifests = _resolve_package_config_path() / "prompts" / "manifests"
+    pkg_manifests = resolve_package_config_path() / "prompts" / "manifests"
     pkg_file = pkg_manifests / manifest_filename
     if not pkg_file.exists():
         return None
@@ -381,32 +564,29 @@ def _update_manifest_default_models(
 
 
 def _prompt_provider_selection() -> str:
-    """交互式让用户选择模型供应商。
+    """交互式让用户选择初始化模型方案。
 
-    已在环境变量中设置了 API Key 的供应商会标注「✓ 已配置」。
+    已在环境变量中设置了 API Key 的方案会标注「✓ 已配置」。
 
     Returns:
-        选中的 API Key 名称。
+        选中的方案 key。
 
     Raises:
         SystemExit: 用户输入无效或 EOF 时退出。
     """
 
-    keys = list(_PROVIDER_DISPLAY_NAMES.keys())
-
-    # 找第一个已配置的供应商作为默认推荐
+    # 找第一个已配置的方案作为默认推荐；共享同一 API Key 的方案按声明顺序优先。
     first_configured_idx = 0
-    for i, key in enumerate(keys):
-        if os.environ.get(key):
+    for i, option in enumerate(_PROVIDER_OPTIONS):
+        if os.environ.get(option.api_key_name):
             first_configured_idx = i
             break
 
-    print("\n请选择你要使用的模型供应商（输入编号）：\n")
-    for i, key in enumerate(keys, 1):
-        display = _PROVIDER_DISPLAY_NAMES[key]
-        configured = "  ✓ 已配置" if os.environ.get(key) else ""
+    print("\n请选择你要使用的初始化模型方案（输入编号）：\n")
+    for i, option in enumerate(_PROVIDER_OPTIONS, 1):
+        configured = "  ✓ 已配置" if os.environ.get(option.api_key_name) else ""
         default_marker = "（默认）" if (i - 1) == first_configured_idx else ""
-        print(f"  {i}. {display}  — {key}{configured}{default_marker}")
+        print(f"  {i}. {option.display_name}  — {option.api_key_name}{configured}{default_marker}")
 
     print()
     default_num = first_configured_idx + 1
@@ -417,7 +597,7 @@ def _prompt_provider_selection() -> str:
         sys.exit(1)
 
     if raw == "":
-        return keys[first_configured_idx]
+        return _PROVIDER_OPTIONS[first_configured_idx].option_key
 
     try:
         idx = int(raw)
@@ -425,11 +605,11 @@ def _prompt_provider_selection() -> str:
         print(f"无效输入: {raw}")
         sys.exit(1)
 
-    if idx < 1 or idx > len(keys):
+    if idx < 1 or idx > len(_PROVIDER_OPTIONS):
         print(f"编号超出范围: {idx}")
         sys.exit(1)
 
-    return keys[idx - 1]
+    return _PROVIDER_OPTIONS[idx - 1].option_key
 
 
 def _prompt_api_key(api_key_name: str) -> str:
@@ -580,12 +760,50 @@ def _prompt_huggingface_config() -> list[tuple[str, str]]:
     return results
 
 
+def _prompt_sec_user_agent() -> tuple[str, str] | None:
+    """交互式配置 SEC User-Agent。
+
+    SEC 要求所有爬虫请求在 User-Agent 中提供真实公司名称和联系邮箱，
+    格式为 ``"CompanyName admin@company.com"``。
+
+    已在环境变量中存在时自动跳过。
+
+    Returns:
+        ``(key_name, value)`` 元组；用户跳过时返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    print("\n— SEC 下载配置 —")
+
+    existing = os.environ.get(SEC_USER_AGENT_ENV)
+    if existing:
+        print(f"  {SEC_USER_AGENT_ENV} 已配置: {existing}，跳过。")
+        return None
+
+    print('  SEC 要求爬虫请求提供真实 User-Agent（含邮箱），')
+    print('  格式示例: "MyCompany admin@mycompany.com"')
+
+    try:
+        value = input(f"  {SEC_USER_AGENT_ENV}（直接回车跳过）: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+    if not value:
+        print("  已跳过。下载 SEC 文件时将使用通用 User-Agent（可能被限流）。")
+        return None
+
+    return SEC_USER_AGENT_ENV, value
+
+
 # --------------------------------------------------------------------------- #
 #  主入口
 # --------------------------------------------------------------------------- #
 
 
-def run_init(args: Namespace) -> int:
+def run_init_command(args: Namespace) -> int:
     """执行 ``dayu-cli init`` 子命令。
 
     Args:
@@ -600,38 +818,50 @@ def run_init(args: Namespace) -> int:
 
     base_dir = Path(args.base).resolve()
     overwrite: bool = getattr(args, "overwrite", False)
-
+    is_first_workspace_init = not (base_dir / "config").exists()
     # 1. 复制配置
     config_dir = _copy_config(base_dir, overwrite=overwrite)
     print(f"✓ 配置已复制到: {config_dir}")
 
-    # 2. 选择供应商 + 输入 API Key（已有则跳过）
-    chosen_key = _prompt_provider_selection()
+    # 1b. 复制 assets（定性分析模板等）
+    assets_dir = _copy_assets(base_dir, overwrite=overwrite)
+    print(f"✓ assets 已复制到: {assets_dir}")
+
+    # 2. 选择初始化模型方案 + 输入 API Key（已有则跳过）
+    chosen_option_key = _prompt_provider_selection()
+    chosen_option = _PROVIDER_OPTIONS_BY_KEY[chosen_option_key]
     env_vars_written = False
     main_key_persist_failed = False
 
-    existing_value = os.environ.get(chosen_key)
+    existing_value = os.environ.get(chosen_option.api_key_name)
     if existing_value:
         masked = existing_value[:4] + "***" + existing_value[-4:] if len(existing_value) > 8 else "***"
-        print(f"\n✓ {chosen_key} 已在环境变量中配置（{masked}），跳过写入。")
+        print(f"\n✓ {chosen_option.api_key_name} 已在环境变量中配置（{masked}），跳过写入。")
     else:
-        api_key_value = _prompt_api_key(chosen_key)
-        _target, ok = _persist_env_var(chosen_key, api_key_value)
+        api_key_value = _prompt_api_key(chosen_option.api_key_name)
+        _target, ok = _persist_env_var(chosen_option.api_key_name, api_key_value)
         env_vars_written = True
         if not ok:
             main_key_persist_failed = True
-            print(f"\n❌ {chosen_key} 无法持久化到系统环境变量。")
+            print(f"\n❌ {chosen_option.api_key_name} 无法持久化到系统环境变量。")
             print(f"   已为当前进程设置，但重开终端后会丢失。")
             print(f"   为避免切换模型后下次启动找不到 API Key，跳过 manifest 更新。")
             print(f"   请手动配置环境变量后重新运行 dayu-cli init。")
 
     # 3. 更新 manifest 默认模型（仅在主 key 持久化成功或已存在时执行）
-    non_thinking, thinking = _PROVIDER_MODEL_MAP[chosen_key]
+    non_thinking = chosen_option.non_thinking_model
+    thinking = chosen_option.thinking_model
     if main_key_persist_failed:
-        print(f"\n⚠️  跳过 manifest 更新（{chosen_key} 未持久化）")
+        print(f"\n⚠️  跳过 manifest 更新（{chosen_option.api_key_name} 未持久化）")
     else:
         updated_count = _update_manifest_default_models(config_dir, non_thinking, thinking)
         print(f"✓ 默认模型已设置为: {non_thinking} / {thinking}（更新了 {updated_count} 个 manifest）")
+
+    should_run_prewarm = _should_run_init_prewarm(
+        is_first_workspace_init=is_first_workspace_init,
+        overwrite=overwrite,
+        main_key_persist_failed=main_key_persist_failed,
+    )
 
     # 4. 可选联网检索 Key
     search_persist_failed = False
@@ -652,6 +882,27 @@ def run_init(args: Namespace) -> int:
             search_persist_failed = True
         display = value if key == "HF_ENDPOINT" else f"{value[:4]}***"
         print(f"✓ {key} 已配置: {display}")
+
+    # 6. SEC User-Agent
+    sec_ua = _prompt_sec_user_agent()
+    if sec_ua is not None:
+        _sec_target, sec_ok = _persist_env_var(sec_ua[0], sec_ua[1])
+        env_vars_written = True
+        if not sec_ok:
+            search_persist_failed = True
+        print(f"✓ {sec_ua[0]} 已配置: {sec_ua[1]}")
+
+    if should_run_prewarm and not main_key_persist_failed:
+        print("\n正在预热 CLI 运行时，请稍候...")
+        prewarm_success, prewarm_message = _run_init_prewarm(
+            base_dir=base_dir,
+            config_dir=config_dir,
+        )
+        if prewarm_success:
+            print("✓ CLI 运行时预热完成")
+        else:
+            print(f"⚠️  CLI 运行时预热失败: {prewarm_message}")
+            print("   不影响当前工作区初始化成功；后续首次运行 prompt / interactive / write 时可能更慢。")
 
     # 6. 完成提示
     print(f"\n✓ 工作区已初始化: {base_dir}")

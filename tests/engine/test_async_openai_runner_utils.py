@@ -5,6 +5,7 @@
 import asyncio
 import time
 
+from collections.abc import Callable
 from types import ModuleType
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -16,7 +17,7 @@ from dayu.contracts.protocols import ToolExecutionContext
 from dayu.contracts.protocols import ToolExecutor
 from dayu.engine import async_openai_runner as aor
 from dayu.engine.sse_parser import should_log_debug
-from dayu.engine.cancellation import CancelledError
+from dayu.contracts.cancellation import CancelledError
 from dayu.engine.events import EventType, StreamEvent
 
 if TYPE_CHECKING:
@@ -71,6 +72,29 @@ class _ContextCaptureExecutor(_ToolExecutorMixin):
 
     def get_schemas(self):
         return []
+
+
+def _wait_until(predicate: Callable[[], bool], timeout_seconds: float, interval_seconds: float = 0.01) -> bool:
+    """轮询等待条件成立。
+
+    Args:
+        predicate: 返回布尔值的条件函数。
+        timeout_seconds: 最大等待秒数。
+        interval_seconds: 轮询间隔秒数。
+
+    Returns:
+        条件是否在超时前成立。
+
+    Raises:
+        无。
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval_seconds)
+    return predicate()
 
 
 def _make_runner():
@@ -459,7 +483,7 @@ async def test_run_tool_call_context_timeout_prefers_tool_timeout_seconds():
     assert result["result"]["ok"] is True
     assert executor.context is not None
     assert isinstance(executor.context, ToolExecutionContext)
-    assert executor.context["timeout"] == 12.5
+    assert executor.context.timeout_seconds == 12.5
 
 
 @pytest.mark.asyncio
@@ -550,5 +574,4 @@ async def test_run_tool_call_timeout_marks_soft_timeout_even_if_thread_finishes_
     assert result["result"]["meta"]["execution_may_continue"] is True
     assert side_effects == []
 
-    await asyncio.sleep(0.08)
-    assert side_effects == ["demo_tool:{'k': 'v'}"]
+    assert _wait_until(lambda: side_effects == ["demo_tool:{'k': 'v'}"], timeout_seconds=1.0)

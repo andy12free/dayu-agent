@@ -8,10 +8,13 @@ from typing import Any, AsyncIterator, Callable, TypeVar, cast
 
 from dayu.contracts.agent_execution import ExecutionContract, deserialize_execution_contract_snapshot
 from dayu.contracts.events import AppEvent, AppResult
+from dayu.contracts.events import PublishedRunEventProtocol
+from dayu.contracts.infrastructure import ModelCatalogProtocol, WorkspaceResourcesProtocol
 from dayu.contracts.reply_outbox import ReplyOutboxRecord, ReplyOutboxState, ReplyOutboxSubmitRequest
 from dayu.contracts.run import RunCancelReason, RunRecord, RunState
 from dayu.contracts.session import SessionRecord, SessionSource, SessionState
 from dayu.execution.options import ResolvedExecutionOptions
+from dayu.engine.tool_registry import ToolRegistry
 from dayu.host.concurrency import SQLiteConcurrencyGovernor
 from dayu.host.executor import DefaultHostExecutor
 from dayu.host.host_execution import HostExecutorProtocol, HostedRunContext, HostedRunSpec
@@ -40,13 +43,12 @@ from dayu.host.protocols import (
     SessionRegistryProtocol,
 )
 from dayu.log import Log
-
-MODULE = "HOST"
 from dayu.host.run_registry import SQLiteRunRegistry
 from dayu.host.scene_preparer import DefaultScenePreparer
 from dayu.host.session_registry import SQLiteSessionRegistry
-from dayu.contracts.infrastructure import ModelCatalogProtocol, WorkspaceResourcesProtocol
-from dayu.contracts.events import PublishedRunEventProtocol
+
+
+MODULE = "HOST"
 
 
 TStreamEvent = TypeVar("TStreamEvent", bound=PublishedRunEventProtocol)
@@ -462,6 +464,11 @@ class Host:
         if session is None:
             raise KeyError(f"session 不存在: {session_id}")
         cancelled_ids = self.cancel_session_runs(session_id)
+        # 清理该 session 关联的待交付回复和待处理对话轮次，
+        # 在 runs 已取消但 session 尚未 close 的窗口内执行，
+        # 避免产生孤儿数据。
+        self._reply_outbox_store.delete_by_session_id(session_id)
+        self._pending_turn_store.delete_by_session_id(session_id)
         self._session_registry.close_session(session_id)
         updated = self.get_session(session_id)
         if updated is None:
@@ -1176,6 +1183,7 @@ def _build_default_scene_preparation(
         workspace=workspace,
         model_catalog=model_catalog,
         default_execution_options=default_execution_options,
+        tool_registry_factory=lambda: ToolRegistry(),
     )
 
 
