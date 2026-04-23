@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -24,6 +25,7 @@ from dayu.services.pending_turns import has_resumable_pending_turn
 from dayu.services.protocols import ChatServiceProtocol, PromptServiceProtocol
 
 MODULE = "APP.INTERACTIVE"
+_WIDE_EAST_ASIAN_WIDTHS = frozenset(("F", "W"))
 
 
 
@@ -91,6 +93,46 @@ class _RenderState:
     line_open: bool = False
     final_content: str = ""
     filtered: bool = False
+
+
+def _measure_display_width(text: str) -> int:
+    """计算文本在等宽终端中的显示宽度。
+
+    Args:
+        text: 待计算文本。
+
+    Returns:
+        终端显示宽度；全角/宽字符按 2 列计算，其余字符按 1 列计算。
+
+    Raises:
+        无。
+    """
+
+    return sum(2 if unicodedata.east_asian_width(char) in _WIDE_EAST_ASIAN_WIDTHS else 1 for char in text)
+
+
+def _print_label_hint_box(label: str) -> None:
+    """在 prompt 输出末尾打印可恢复标签提示框。
+
+    Args:
+        label: 当前 conversation label。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    line = f"标签: {label}"
+    line_width = _measure_display_width(line)
+    content_width = line_width + 2
+    trailing_padding_width = content_width - 1 - line_width
+    top_bottom = f"+{'-' * content_width}+"
+    middle = f"| {line}{' ' * trailing_padding_width}|"
+    print(top_bottom)
+    print(middle)
+    print(top_bottom)
 
 
 def _stop_spinner_if_needed(state: _RenderState) -> None:
@@ -279,6 +321,8 @@ async def _consume_chat_turn_stream(
     state: _RenderState,
     *,
     session_id: str | None,
+    scene_name: str = "interactive",
+    ticker: str | None = None,
     execution_options: ExecutionOptions | None = None,
 ) -> tuple[str, str]:
     """消费单轮 chat 事件流并实时渲染。
@@ -288,6 +332,8 @@ async def _consume_chat_turn_stream(
         user_input: 用户输入文本。
         state: 渲染状态。
         session_id: 会话 ID；首轮可为空。
+        scene_name: 本轮执行使用的 scene 名称。
+        ticker: 股票代码。
         execution_options: 请求级执行覆盖参数。
 
     Returns:
@@ -301,8 +347,9 @@ async def _consume_chat_turn_stream(
     request = ChatTurnRequest(
         session_id=session_id,
         user_text=user_input,
+        ticker=ticker,
         execution_options=execution_options,
-        scene_name="interactive",
+        scene_name=scene_name,
         session_resolution_policy=SessionResolutionPolicy.ENSURE_DETERMINISTIC,
     )
     submission = await session.submit_turn(request)
@@ -314,15 +361,29 @@ def _resume_interactive_pending_turn_if_needed(
     session: ChatServiceProtocol,
     *,
     session_id: str | None,
+    scene_name: str = "interactive",
     show_thinking: bool,
 ) -> None:
-    """在进入 REPL 前恢复当前 interactive session 的 pending turn。"""
+    """在进入 REPL 前恢复当前 interactive session 的 pending turn。
+
+    Args:
+        session: interactive 使用的 ChatService 协议实现。
+        session_id: 当前 interactive 绑定的 Host session ID；为空时直接跳过恢复。
+        scene_name: 本次 interactive 会话对应的 scene 名称，默认使用 `interactive`。
+        show_thinking: 是否展示 thinking 流。
+
+    Returns:
+        无。
+
+    Raises:
+        Exception: 当 pending turn 仍然存在且恢复失败时，继续向上抛出原始异常。
+    """
 
     if session_id is None:
         return
     pending_turns = session.list_resumable_pending_turns(
         session_id=session_id,
-        scene_name="interactive",
+        scene_name=scene_name,
     )
     if not pending_turns:
         return
@@ -410,6 +471,8 @@ def _run_chat_turn_stream(
     user_input: str,
     *,
     session_id: str | None,
+    scene_name: str = "interactive",
+    ticker: str | None = None,
     execution_options: ExecutionOptions | None = None,
     show_thinking: bool = False,
     show_waiting_spinner: bool = False,
@@ -420,6 +483,8 @@ def _run_chat_turn_stream(
         session: 聊天会话服务。
         user_input: 用户输入文本。
         session_id: 会话 ID；首轮可为空。
+        scene_name: 本轮执行使用的 scene 名称。
+        ticker: 股票代码。
         execution_options: 请求级执行覆盖参数。
         show_thinking: 是否回显 thinking 增量。
         show_waiting_spinner: 是否在首个可见输出前显示等待 spinner。
@@ -441,6 +506,8 @@ def _run_chat_turn_stream(
                 user_input,
                 state,
                 session_id=session_id,
+                scene_name=scene_name,
+                ticker=ticker,
                 execution_options=execution_options,
             )
         )
@@ -498,6 +565,7 @@ def interactive(
     agent_session: ChatServiceProtocol,
     *,
     session_id: str | None = None,
+    scene_name: str = "interactive",
     execution_options: ExecutionOptions | None = None,
     show_thinking: bool = False,
 ) -> None:
@@ -506,6 +574,7 @@ def interactive(
     Args:
         agent_session: 已装配的聊天会话服务。
         session_id: 可选初始会话 ID。
+        scene_name: 本轮 turn 使用的 scene 名称。
         execution_options: 请求级执行覆盖参数。
         show_thinking: 是否回显 thinking 增量。
 
@@ -546,6 +615,7 @@ def interactive(
     _resume_interactive_pending_turn_if_needed(
         agent_session,
         session_id=session_id,
+        scene_name=scene_name,
         show_thinking=show_thinking,
     )
 
@@ -572,6 +642,7 @@ def interactive(
                 agent_session,
                 user_input,
                 session_id=session_id,
+                scene_name=scene_name,
                 execution_options=execution_options,
                 show_thinking=show_thinking,
                 show_waiting_spinner=not show_thinking,
@@ -617,6 +688,57 @@ def prompt(
             show_thinking=show_thinking,
             show_waiting_spinner=not show_thinking,
         )
+    except ValueError as exc:
+        Log.error(str(exc), module=MODULE)
+        return 2
+    except RuntimeError as exc:
+        Log.error(f"{exc}，退出 prompt 模式", module=MODULE)
+        return 2
+    return 0
+
+
+def conversation_prompt(
+    chat_service: ChatServiceProtocol,
+    user_input: str,
+    *,
+    label: str,
+    session_id: str,
+    scene_name: str,
+    ticker: str | None = None,
+    execution_options: ExecutionOptions | None = None,
+    show_thinking: bool = False,
+) -> int:
+    """执行单轮 conversation prompt 命令。
+
+    Args:
+        chat_service: 已装配的聊天服务。
+        user_input: 单次输入文本。
+        label: 当前可恢复对话标签。
+        session_id: label registry 解析得到的确定性会话 ID。
+        scene_name: 本轮 turn 使用的 scene 名称。
+        ticker: 股票代码。
+        execution_options: 请求级执行覆盖参数。
+        show_thinking: 是否回显 thinking 增量。
+
+    Returns:
+        退出码，``0`` 表示成功，``2`` 表示失败。
+
+    Raises:
+        无。
+    """
+
+    try:
+        _run_chat_turn_stream(
+            chat_service,
+            user_input,
+            session_id=session_id,
+            scene_name=scene_name,
+            ticker=ticker,
+            execution_options=execution_options,
+            show_thinking=show_thinking,
+            show_waiting_spinner=not show_thinking,
+        )
+        _print_label_hint_box(label)
     except ValueError as exc:
         Log.error(str(exc), module=MODULE)
         return 2
