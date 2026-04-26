@@ -603,6 +603,10 @@ class SSEStreamParser:
                         ),
                     )
                     continue
+                # 兼容不发 index 的 provider（如 Gemini OpenAI 兼容模式），
+                # 用数组下标补齐，使下游 _handle_tool_call_delta 无需特殊处理。
+                if "index" not in tc:
+                    tc = {**tc, "index": index}
                 async for event in self._handle_tool_call_delta(tc):
                     yield event
 
@@ -660,7 +664,11 @@ class SSEStreamParser:
         args_delta: str | None = None
         if "arguments" in func:
             raw_args_delta = func["arguments"]
-            if not isinstance(raw_args_delta, str):
+            if raw_args_delta is None:
+                # 某些 provider（如 Qwen thinking 模式）在 tool call delta 中
+                # 会发送 "arguments": null，等价于不存在该字段，安全忽略。
+                pass
+            elif not isinstance(raw_args_delta, str):
                 self._record_protocol_error(
                     "tool_call_incomplete",
                     "Tool call arguments incomplete or invalid",
@@ -675,7 +683,8 @@ class SSEStreamParser:
                     ),
                 )
                 return
-            args_delta = raw_args_delta
+            else:
+                args_delta = raw_args_delta
 
         # 记录 id（首次出现即写入）；只接受非空字符串，非字符串或空字符串均视为未提供
         tc_id_raw = tc.get("id")
