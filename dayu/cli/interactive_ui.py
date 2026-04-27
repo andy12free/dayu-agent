@@ -18,6 +18,7 @@ from typing import Any
 import sys
 
 from dayu.contracts.events import AppEventType, extract_cancel_reason
+from dayu.process_lifecycle import EXIT_CODE_SIGINT, RunLifecycleObserver
 from dayu.text import strip_markdown_fence
 from dayu.execution.options import ExecutionOptions
 from dayu.log import Log
@@ -461,6 +462,93 @@ def _format_cancelled_message(payload: Any) -> str:
         return f"[cancelled] 执行已取消: {reason}"
     return "[cancelled] 执行已取消"
 
+
+def _extract_run_id_from_event(event: object) -> str | None:
+    """从事件对象中提取稳定的 ``run_id``。
+
+    Args:
+        event: 事件流中产生的事件对象，期望其 ``meta`` 字段为 ``dict``，
+            且包含字符串 ``run_id`` 键。
+
+    Returns:
+        非空字符串形式的 ``run_id``；事件未携带合法 ``run_id`` 时返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    meta = getattr(event, "meta", None)
+    if isinstance(meta, dict):
+        candidate = meta.get("run_id")
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+class _RunIdLifecycleTracker:
+    """在事件流期间登记/清理当前 run 的小型生命周期跟踪器。
+
+    职责：把 `_consume_chat_turn_stream` 与 `_consume_prompt_stream` 中
+    重复的「首帧 ``meta["run_id"]`` 登记 → finally clear」样板抽到一处，
+    避免在两个事件消费器内重复维护协调器交互逻辑。
+    """
+
+    def __init__(self, observer: RunLifecycleObserver | None) -> None:
+        """初始化跟踪器。
+
+        Args:
+            observer: 可选的进程级 run 生命周期观察者；为 ``None`` 时
+                所有跟踪操作都是 no-op。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._observer = observer
+        self._registered_run_id: str | None = None
+
+    def observe(self, event: object) -> None:
+        """检查事件并在拿到首个 ``run_id`` 时登记到观察者。
+
+        Args:
+            event: 事件流中产生的事件对象。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        if self._observer is None or self._registered_run_id is not None:
+            return
+        run_id = _extract_run_id_from_event(event)
+        if run_id is None:
+            return
+        self._observer.register_active_run(run_id)
+        self._registered_run_id = run_id
+
+    def clear(self) -> None:
+        """事件流结束后从观察者清理已登记的 run。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        if self._observer is None or self._registered_run_id is None:
+            return
+        self._observer.clear_active_run(self._registered_run_id)
+        self._registered_run_id = None
+
 async def _consume_chat_turn_stream(
     session: ChatServiceProtocol,
     user_input: str,
@@ -470,6 +558,7 @@ async def _consume_chat_turn_stream(
     scene_name: str = "interactive",
     ticker: str | None = None,
     execution_options: ExecutionOptions | None = None,
+    run_lifecycle_observer: RunLifecycleObserver | None = None,
 ) -> tuple[str, str]:
     """消费单轮 chat 事件流并实时渲染。
 
@@ -481,6 +570,9 @@ async def _consume_chat_turn_stream(
         scene_name: 本轮执行使用的 scene 名称。
         ticker: 股票代码。
         execution_options: 请求级执行覆盖参数。
+        run_lifecycle_observer: 可选的进程级 run 生命周期观察者，
+            用于在拿到 ``meta["run_id"]`` 后登记当前 run，配合 Ctrl-C
+            协作式取消。
 
     Returns:
         `(最终答案文本, 本轮解析后的 session_id)`。
@@ -499,8 +591,13 @@ async def _consume_chat_turn_stream(
         session_resolution_policy=SessionResolutionPolicy.ENSURE_DETERMINISTIC,
     )
     submission = await session.submit_turn(request)
-    async for event in submission.event_stream:
-        _render_stream_event(event, state)
+    tracker = _RunIdLifecycleTracker(run_lifecycle_observer)
+    try:
+        async for event in submission.event_stream:
+            tracker.observe(event)
+            _render_stream_event(event, state)
+    finally:
+        tracker.clear()
     return state.final_content, submission.session_id
 
 def _resume_interactive_pending_turn_if_needed(
@@ -586,6 +683,7 @@ async def _consume_prompt_stream(
     *,
     ticker: str | None,
     execution_options: ExecutionOptions | None = None,
+    run_lifecycle_observer: RunLifecycleObserver | None = None,
 ) -> str:
     """消费单次 prompt 的事件流并实时渲染。
 
@@ -595,6 +693,8 @@ async def _consume_prompt_stream(
         state: 渲染状态。
         ticker: 股票代码。
         execution_options: 请求级执行覆盖参数。
+        run_lifecycle_observer: 可选的 run 生命周期观察者；当事件流首帧
+            携带 ``meta["run_id"]`` 时登记到协调器，让 Ctrl-C 能驱动协作式取消。
 
     Returns:
         最终答案文本。
@@ -610,8 +710,13 @@ async def _consume_prompt_stream(
         execution_options=execution_options,
     )
     submission = await session.submit(request)
-    async for event in submission.event_stream:
-        _render_stream_event(event, state)
+    tracker = _RunIdLifecycleTracker(run_lifecycle_observer)
+    try:
+        async for event in submission.event_stream:
+            tracker.observe(event)
+            _render_stream_event(event, state)
+    finally:
+        tracker.clear()
     return state.final_content
 
 
@@ -624,6 +729,7 @@ def _run_chat_turn_stream(
     ticker: str | None = None,
     execution_options: ExecutionOptions | None = None,
     show_thinking: bool = False,
+    run_lifecycle_observer: RunLifecycleObserver | None = None,
 ) -> tuple[str, str]:
     """执行单轮 chat 的同步包装入口。
 
@@ -635,6 +741,8 @@ def _run_chat_turn_stream(
         ticker: 股票代码。
         execution_options: 请求级执行覆盖参数。
         show_thinking: 是否回显 thinking 增量。
+        run_lifecycle_observer: 可选的 run 生命周期观察者，用于配合
+            进程级协调器在 Ctrl-C 时触发协作式取消。
 
     Returns:
         `(最终答案文本, 本轮解析后的 session_id)`。
@@ -658,6 +766,7 @@ def _run_chat_turn_stream(
                 scene_name=scene_name,
                 ticker=ticker,
                 execution_options=execution_options,
+                run_lifecycle_observer=run_lifecycle_observer,
             )
         )
     finally:
@@ -674,6 +783,7 @@ def _run_prompt_stream(
     ticker: str | None,
     execution_options: ExecutionOptions | None = None,
     show_thinking: bool = False,
+    run_lifecycle_observer: RunLifecycleObserver | None = None,
 ) -> str:
     """执行单次 prompt 的同步包装入口。
 
@@ -683,6 +793,8 @@ def _run_prompt_stream(
         ticker: 股票代码。
         execution_options: 请求级执行覆盖参数。
         show_thinking: 是否回显 thinking 增量。
+        run_lifecycle_observer: 可选的 run 生命周期观察者；事件流首帧
+            带 ``meta["run_id"]`` 时登记到协调器，让 Ctrl-C 走协作式取消。
 
     Returns:
         最终答案文本。
@@ -704,6 +816,7 @@ def _run_prompt_stream(
                 state,
                 ticker=ticker,
                 execution_options=execution_options,
+                run_lifecycle_observer=run_lifecycle_observer,
             )
         )
     finally:
@@ -719,6 +832,7 @@ def interactive(
     scene_name: str = "interactive",
     execution_options: ExecutionOptions | None = None,
     show_thinking: bool = False,
+    run_lifecycle_observer: RunLifecycleObserver | None = None,
 ) -> None:
     """执行交互式多轮输入循环。
 
@@ -728,6 +842,8 @@ def interactive(
         scene_name: 本轮 turn 使用的 scene 名称。
         execution_options: 请求级执行覆盖参数。
         show_thinking: 是否回显 thinking 增量。
+        run_lifecycle_observer: 可选的进程级 run 生命周期观察者，
+            用于让 Ctrl-C 在事件流中触发 cooperative cancel。
 
     Returns:
         无。
@@ -802,10 +918,12 @@ def interactive(
                 scene_name=scene_name,
                 execution_options=execution_options,
                 show_thinking=show_thinking,
+                run_lifecycle_observer=run_lifecycle_observer,
             )
         except KeyboardInterrupt:
-            # 已知限制：中断仅停止事件消费，不触发 CancellationToken 协作式取消。
-            # host 层残留的 running 状态 run 会在进程退出后由 cleanup_orphan_runs 回收。
+            # 信号路径已通过 ProcessShutdownCoordinator 触发协作式取消，
+            # 这里只负责把控制权交还 REPL；事件流中的 CANCELLED 事件已由
+            # _consume_chat_turn_stream 处理，run_id 也已 clear。
             print("\n[interrupted]")
             continue
         except ValueError as exc:
@@ -823,6 +941,7 @@ def prompt(
     ticker: str | None = None,
     execution_options: ExecutionOptions | None = None,
     show_thinking: bool = False,
+    run_lifecycle_observer: RunLifecycleObserver | None = None,
 ) -> int:
     """执行单次 prompt 命令。
 
@@ -832,6 +951,8 @@ def prompt(
         ticker: 股票代码。
         execution_options: 请求级执行覆盖参数。
         show_thinking: 是否回显 thinking 增量。
+        run_lifecycle_observer: 可选的 run 生命周期观察者；用于让 Ctrl-C
+            通过事件 ``meta["run_id"]`` 触发协作式取消，与 chat 路径一致。
 
     Returns:
         退出码，``0`` 表示成功，``2`` 表示失败。
@@ -847,10 +968,11 @@ def prompt(
             ticker=ticker,
             execution_options=execution_options,
             show_thinking=show_thinking,
+            run_lifecycle_observer=run_lifecycle_observer,
         )
     except KeyboardInterrupt:
         print("\n[interrupted]")
-        return 130
+        return EXIT_CODE_SIGINT
     except ValueError as exc:
         Log.error(str(exc), module=MODULE)
         return 2
@@ -870,6 +992,7 @@ def conversation_prompt(
     ticker: str | None = None,
     execution_options: ExecutionOptions | None = None,
     show_thinking: bool = False,
+    run_lifecycle_observer: RunLifecycleObserver | None = None,
 ) -> int:
     """执行单轮 conversation prompt 命令。
 
@@ -882,6 +1005,8 @@ def conversation_prompt(
         ticker: 股票代码。
         execution_options: 请求级执行覆盖参数。
         show_thinking: 是否回显 thinking 增量。
+        run_lifecycle_observer: 可选的进程级 run 生命周期观察者，
+            用于让 Ctrl-C 触发 cooperative cancel。
 
     Returns:
         退出码，``0`` 表示成功，``2`` 表示失败。
@@ -899,11 +1024,12 @@ def conversation_prompt(
             ticker=ticker,
             execution_options=execution_options,
             show_thinking=show_thinking,
+            run_lifecycle_observer=run_lifecycle_observer,
         )
         _print_label_hint_box(label)
     except KeyboardInterrupt:
         print("\n[interrupted]")
-        return 130
+        return EXIT_CODE_SIGINT
     except ValueError as exc:
         Log.error(str(exc), module=MODULE)
         return 2
