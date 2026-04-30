@@ -23,6 +23,7 @@ from dayu.host.pending_turn_store import (
 )
 from dayu.host.prepared_turn import PreparedAgentTurnSnapshot
 from dayu.contracts.cancellation import CancellationToken
+from dayu.process_liveness import OwnerIdentity
 
 
 TStreamEvent = TypeVar("TStreamEvent")
@@ -212,9 +213,11 @@ class StubRunRegistry:
         metadata: ExecutionDeliveryContext | None = None,
     ) -> RunRecord:
         """注册 run。"""
-        import os
+        from dayu.process_liveness import current_owner_identity
+
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         now = datetime.now(timezone.utc)
+        owner = current_owner_identity()
         record = RunRecord(
             run_id=run_id,
             session_id=session_id,
@@ -224,7 +227,9 @@ class StubRunRegistry:
             created_at=now,
             cancel_requested_at=None,
             cancel_requested_reason=None,
-            owner_pid=os.getpid(),
+            owner_pid=owner.pid,
+            owner_process_start_time=owner.process_start_time,
+            owner_boot_id=owner.boot_id,
             metadata=metadata if metadata is not None else empty_execution_delivery_context(),
         )
         self._runs[run_id] = record
@@ -233,82 +238,47 @@ class StubRunRegistry:
     def start_run(self, run_id: str) -> RunRecord:
         """标记 RUNNING。"""
         record = self._runs[run_id]
-        self._runs[run_id] = RunRecord(
-            run_id=record.run_id,
-            session_id=record.session_id,
-            service_type=record.service_type,
-            scene_name=record.scene_name,
+        self._runs[run_id] = dataclass_replace(
+            record,
             state=RunState.RUNNING,
-            created_at=record.created_at,
             started_at=datetime.now(timezone.utc),
-            cancel_requested_at=record.cancel_requested_at,
-            cancel_requested_reason=record.cancel_requested_reason,
             cancel_reason=None,
-            owner_pid=record.owner_pid,
-            metadata=record.metadata,
         )
         return self._runs[run_id]
 
     def complete_run(self, run_id: str, *, error_summary: str | None = None) -> RunRecord:
         """标记成功。"""
         record = self._runs[run_id]
-        self._runs[run_id] = RunRecord(
-            run_id=record.run_id,
-            session_id=record.session_id,
-            service_type=record.service_type,
-            scene_name=record.scene_name,
+        self._runs[run_id] = dataclass_replace(
+            record,
             state=RunState.SUCCEEDED,
-            created_at=record.created_at,
-            started_at=record.started_at,
             completed_at=datetime.now(timezone.utc),
             error_summary=error_summary,
-            cancel_requested_at=record.cancel_requested_at,
-            cancel_requested_reason=record.cancel_requested_reason,
             cancel_reason=None,
-            owner_pid=record.owner_pid,
-            metadata=record.metadata,
         )
         return self._runs[run_id]
 
     def fail_run(self, run_id: str, *, error_summary: str | None = None) -> RunRecord:
         """标记失败。"""
         record = self._runs[run_id]
-        self._runs[run_id] = RunRecord(
-            run_id=record.run_id,
-            session_id=record.session_id,
-            service_type=record.service_type,
-            scene_name=record.scene_name,
+        self._runs[run_id] = dataclass_replace(
+            record,
             state=RunState.FAILED,
-            created_at=record.created_at,
-            started_at=record.started_at,
             completed_at=datetime.now(timezone.utc),
             error_summary=error_summary,
-            cancel_requested_at=record.cancel_requested_at,
-            cancel_requested_reason=record.cancel_requested_reason,
             cancel_reason=None,
-            owner_pid=record.owner_pid,
-            metadata=record.metadata,
         )
         return self._runs[run_id]
 
     def mark_unsettled(self, run_id: str, *, error_summary: str | None = None) -> RunRecord:
         """标记 UNSETTLED（测试桩同 fail_run 模型）。"""
         record = self._runs[run_id]
-        self._runs[run_id] = RunRecord(
-            run_id=record.run_id,
-            session_id=record.session_id,
-            service_type=record.service_type,
-            scene_name=record.scene_name,
+        self._runs[run_id] = dataclass_replace(
+            record,
             state=RunState.UNSETTLED,
-            created_at=record.created_at,
-            started_at=record.started_at,
             completed_at=datetime.now(timezone.utc),
             error_summary=error_summary,
-            cancel_requested_at=record.cancel_requested_at,
-            cancel_requested_reason=record.cancel_requested_reason,
             cancel_reason=None,
-            owner_pid=record.owner_pid,
-            metadata=record.metadata,
         )
         return self._runs[run_id]
 
@@ -320,20 +290,11 @@ class StubRunRegistry:
     ) -> RunRecord:
         """标记取消。"""
         record = self._runs[run_id]
-        self._runs[run_id] = RunRecord(
-            run_id=record.run_id,
-            session_id=record.session_id,
-            service_type=record.service_type,
-            scene_name=record.scene_name,
+        self._runs[run_id] = dataclass_replace(
+            record,
             state=RunState.CANCELLED,
-            created_at=record.created_at,
-            started_at=record.started_at,
             completed_at=datetime.now(timezone.utc),
-            cancel_requested_at=record.cancel_requested_at,
-            cancel_requested_reason=record.cancel_requested_reason,
             cancel_reason=cancel_reason,
-            owner_pid=record.owner_pid,
-            metadata=record.metadata,
         )
         return self._runs[run_id]
 
@@ -362,21 +323,10 @@ class StubRunRegistry:
             return False
         if record.cancel_requested_at is not None:
             return False
-        self._runs[run_id] = RunRecord(
-            run_id=record.run_id,
-            session_id=record.session_id,
-            service_type=record.service_type,
-            scene_name=record.scene_name,
-            state=record.state,
-            created_at=record.created_at,
-            started_at=record.started_at,
-            completed_at=record.completed_at,
-            error_summary=record.error_summary,
+        self._runs[run_id] = dataclass_replace(
+            record,
             cancel_requested_at=datetime.now(timezone.utc),
             cancel_requested_reason=cancel_reason,
-            cancel_reason=record.cancel_reason,
-            owner_pid=record.owner_pid,
-            metadata=record.metadata,
         )
         return True
 
@@ -403,14 +353,34 @@ class StubRunRegistry:
 
         return [run for run in self._runs.values() if run.state in {RunState.CREATED, RunState.QUEUED, RunState.RUNNING}]
 
-    def list_active_runs_for_owner(self, owner_pid: int) -> list[RunRecord]:
-        """按 owner_pid 过滤活跃 run。"""
+    def list_active_runs_for_owner(self, owner: OwnerIdentity) -> list[RunRecord]:
+        """按完整 ``OwnerIdentity`` 三元组过滤活跃 run。
 
-        return [
-            run for run in self._runs.values()
-            if run.state in {RunState.CREATED, RunState.QUEUED, RunState.RUNNING}
-            and run.owner_pid == int(owner_pid)
-        ]
+        与 SQLite 实现保持等价语义：PID 必须严格相同；
+        ``process_start_time`` / ``boot_id`` 任一字段两侧均非 ``None``
+        时必须等值，否则不参与等值校验（自动降级为剩余字段比对）。
+        """
+
+        result: list[RunRecord] = []
+        for run in self._runs.values():
+            if run.state not in {RunState.CREATED, RunState.QUEUED, RunState.RUNNING}:
+                continue
+            if run.owner_pid != int(owner.pid):
+                continue
+            if (
+                run.owner_process_start_time is not None
+                and owner.process_start_time is not None
+                and run.owner_process_start_time != owner.process_start_time
+            ):
+                continue
+            if (
+                run.owner_boot_id is not None
+                and owner.boot_id is not None
+                and run.owner_boot_id != owner.boot_id
+            ):
+                continue
+            result.append(run)
+        return result
 
     def cleanup_orphan_runs(self) -> list[str]:
         """测试桩不做 orphan 清理。"""
