@@ -23,6 +23,8 @@
 
 ## 架构硬约束
 
+- Dayu 的架构定位是：宿主强约束下的 `LLM in the loop`，不是 `LLM on the loop`。
+- Host 对 Agent / AsyncAgent / AsyncOpenAIRunner 的生命周期、取消、治理是强约束真源。
 - 严格遵守分层架构：`UI -> Service -> Host -> Agent`。
 - 禁止反向依赖。
 - 设计下层组件接口时，必须假设上层组件不存在，只考虑上层调用需求，不向上泄漏实现细节。
@@ -47,7 +49,12 @@
   - 兼容性 wrapper / facade：方法体仅透传到真源模块，不增加有效语义。
 - 编写规则时优先自适应实现，禁止把业务规则硬编码成脆弱分支。
 - 默认按全新设计处理，不为旧实现、旧接口、旧测试保留兼容逻辑。
-- 涉及 schema 变更时，一律按全新 schema 起库处理；禁止旧库迁移、兼容读取、兼容测试，除非当前任务明确要求兼容升级；旧库迁移动作作为 `workspace_migrations` 的一个插件进入`dayu-cli init` 流程。
+
+## schema 变更
+
+- 涉及 schema 变更时：
+  - 一律按全新 schema 起库处理；禁止旧库兼容读取、兼容测试，除非当前任务明确要求兼容升级；
+  - 同时必须将旧库迁移动作作为 `workspace_migrations` 的一个插件进入`dayu-cli init` 流程。
 
 ## 测试与验证
 
