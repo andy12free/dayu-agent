@@ -1505,9 +1505,23 @@ class HostAdminOperationsProtocol(
         ...
 
 
+@runtime_checkable
+class ChatServiceHostProtocol(
+    ConversationalExecutionGatewayProtocol,
+    HostAdminOperationsProtocol,
+    Protocol,
+):
+    """ChatService 可见的宿主能力完整协议。
+
+    组合 ``ConversationalExecutionGatewayProtocol`` 的执行能力与
+    ``HostAdminOperationsProtocol`` 的历史读取与会话清空能力。
+    """
+
+
 __all__ = [
     "ConversationSessionDigest",
     "ConversationSessionTurnExcerpt",
+    "ChatServiceHostProtocol",
     "ConversationalExecutionGatewayProtocol",
     "ConcurrencyGovernorProtocol",
     "ConcurrencyPermit",
