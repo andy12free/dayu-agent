@@ -139,7 +139,7 @@ pip install -e ".[test,dev,browser,web]" -c constraints/lock-macos-arm64-py311.t
 playwright install chromium
 ```
 
-如需渲染 PDF，可选安装 `pandoc`：
+如需使用 `dayu-render` 将 Markdown 导出为 **HTML、Word（.docx）或 PDF**，需要安装 `pandoc`，详见「§6 渲染输出」。可选安装方式：
 
 - macOS：`brew install pandoc`
 - Ubuntu / Debian：`sudo apt-get install pandoc`
@@ -1143,7 +1143,7 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 - `.pdf`
 
 说明：
-- 生成 PDF 需要 `pandoc + Chrome`
+- 生成 **HTML**、**Word（.docx）** 需要 `pandoc`；生成 **PDF** 需要 `pandoc`（先由 Pandoc 生成 HTML）以及 Chrome（Headless 打印为 PDF）
 - 若 Chrome 不在标准位置，可设置 `PUPPETEER_EXECUTABLE_PATH`
 - 渲染器会保留 Markdown 里的普通换行；例如列表项里单独一行的“标签”与下一行正文，在 `.docx` 中会继续换行显示
 
